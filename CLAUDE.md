@@ -7,9 +7,9 @@
 - Before executing any live network commands, confirm whether the target is `devnet` or `mainnet-beta`.
 
 ## Technical Stack & Frameworks
-- **Language**: TypeScript / Node.js
+- **Language**: python TypeScript / Node.js
 - **Solana Libraries**: `@solana/web3.js` (v1.x legacy or v2.x web3, stick to existing package signatures) and `@solana/spl-token`.
-- **DEX Protocols**: Raydium AMM (V4/Clmm), Jupiter AG API (V6) for swaps and routing, or Pump.fun bonding curves.
+- **DEX Protocols**: Raydiu m AMM (V4/Clmm), Jupiter AG API (V6) for swaps and routing, or Pump.fun bonding curves.
 
 ## Code Style & Architecture
 - **Transaction Safety**: Always implement robust retry logic with exponential backoff for transaction broadcasting.
@@ -44,3 +44,4 @@ claude "Review my current package.json and outline the architecture for our Sola
 - Run bot simulation: `python main.py --dry-run`
 - Run test suite: `pytest`
 - Format check: `black .` or `flake8`
+ 
