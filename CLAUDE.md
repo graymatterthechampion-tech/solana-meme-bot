@@ -1,4 +1,4 @@
-  # Claude Code Guidelines: Solana Meme Bot
+-  # Claude Code Guidelines: Solana Meme Bot
 
 ## Operational & Security Rules
 - NEVER hardcode private keys, seed phrases, or RPC secret URLs. 
@@ -7,7 +7,7 @@
 - Before executing any live network commands, confirm whether the target is `devnet` or `mainnet-beta`.
 
 ## Technical Stack & Frameworks
-- **Language**: python TypeScript / Node.js
+- **Language**: python
 - **Solana Libraries**: `@solana/web3.js` (v1.x legacy or v2.x web3, stick to existing package signatures) and `@solana/spl-token`.
 - **DEX Protocols**: Raydiu m AMM (V4/Clmm), Jupiter AG API (V6) for swaps and routing, or Pump.fun bonding curves.
 
