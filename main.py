@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import sys
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, List, Optional
 
@@ -180,11 +181,53 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+# 5-row ASCII block glyphs, all uniform-width, for the startup banner.
+_GLYPHS: dict[str, List[str]] = {
+    "H": ["H   H", "H   H", "HHHHH", "H   H", "H   H"],
+    "E": ["EEEEE", "E    ", "EEEE ", "E    ", "EEEEE"],
+    "L": ["L    ", "L    ", "L    ", "L    ", "LLLLL"],
+    "I": ["IIIII", "  I  ", "  I  ", "  I  ", "IIIII"],
+    "X": ["X   X", " X X ", "  X  ", " X X ", "X   X"],
+    "V": ["V   V", "V   V", "V   V", " V V ", "  V  "],
+    "C": [" CCCC", "C    ", "C    ", "C    ", " CCCC"],
+    "T": ["TTTTT", "  T  ", "  T  ", "  T  ", "  T  "],
+    "O": [" OOO ", "O   O", "O   O", "O   O", " OOO "],
+    "R": ["RRRR ", "R   R", "RRRR ", "R  R ", "R   R"],
+    " ": ["     ", "     ", "     ", "     ", "     "],
+}
+
+
+def _render_block(text: str) -> List[str]:
+    """Render text into 5 rows of ASCII block letters (alignment guaranteed)."""
+    return [" ".join(_GLYPHS[ch][row] for ch in text) for row in range(5)]
+
+
+def print_banner(mode: str, network: str) -> None:
+    """Print the startup banner once. Cosmetic only; uses plain print().
+
+    ASCII-only (hyphen, not em dash) so it renders safely in a standard
+    ~80-col terminal without Windows console encoding errors.
+    """
+    rule = "=" * 70
+    print()
+    print(rule)
+    for line in _render_block("HELIX VECTOR"):
+        print(line)
+    print()
+    print("        v1.0 - Solana Execution Bot")
+    print(f"        mode: {mode}   network: {network}")
+    print(rule)
+    print()
+    # Flush so the banner lands before any (stderr) log output when piped.
+    sys.stdout.flush()
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     args = parse_args()
 
     mode = "DRY-RUN" if args.dry_run else "LIVE"
+    print_banner(mode, config.SOLANA_NETWORK)
     logger.info("[startup] Helix Vector 1.0 | mode=%s network=%s", mode, config.SOLANA_NETWORK)
 
     if not args.dry_run:
