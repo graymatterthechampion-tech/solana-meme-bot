@@ -23,7 +23,7 @@
 ## Trading Strategy Principles
 - Each strategy is a separate module under `strategies/`.
 - **Profit-taking** (fires each tier once): at >=2x sell 50% of original, at >=5x sell 25% of original, at >=10x sell 15% of original, retain a 10% moonbag.
-- **Hard exits** (sell entire remaining position, moonbag included) trigger on: volume below 20% of peak 5m volume, liquidity below 70% of entry liquidity, or a single sell exceeding 5% of pool liquidity.
+- **Hard exits** (sell entire remaining position, moonbag included) trigger on: rolling 15m volume dropping more than 70% from peak (i.e. current volume below 30% of peak), liquidity below 70% of entry liquidity, or a single sell exceeding 5% of pool liquidity.
 - **Priority rule**: hard-exit checks run BEFORE profit-taking in the main loop. If a hard exit fires, exit fully and skip profit logic.
 
 ## MEV / Sandwich Protection
