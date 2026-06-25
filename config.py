@@ -48,3 +48,8 @@ WALLET_PRIVATE_KEY: Optional[str] = _get("WALLET_PRIVATE_KEY")
 JUPITER_API_URL: str = _get(
     "JUPITER_API_URL", "https://quote-api.jup.ag/v6"
 ) or "https://quote-api.jup.ag/v6"
+
+# Market-data provider credentials (optional until the real feeds are wired).
+# Never hardcode — read from .env. Dexscreener needs no key.
+BIRDEYE_API_KEY: Optional[str] = _get("BIRDEYE_API_KEY")
+HELIUS_API_KEY: Optional[str] = _get("HELIUS_API_KEY")
