@@ -18,14 +18,29 @@ import argparse
 import asyncio
 import logging
 import sys
+import time
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, List, Optional
 
 import config
 from data.market_feed import SCENARIOS, make_scenario_provider, mock_market_snapshot
+from safety.rug_check import (
+    SafetyReport,
+    evaluate_token_safety,
+    mock_safe_token_data,
+)
 from strategies import hard_exit, profit_taking
+from strategies.entry import (
+    EntryAction,
+    EntryDecision,
+    EntryMarketData,
+    evaluate_entry,
+)
 from strategies.hard_exit import ExitDecision, MarketData
 from strategies.profit_taking import Position, SellAction
+
+# Async safety gate: mint -> read-only SafetyReport.
+SafetyChecker = Callable[[str], Awaitable[SafetyReport]]
 
 # Async source that yields a snapshot (or None, fail-closed) for a token.
 SnapshotProvider = Callable[[str, float], Awaitable[Optional[MarketData]]]
@@ -150,6 +165,110 @@ async def run_loop(
     return outcomes
 
 
+@dataclass
+class TradeSession:
+    """The full lifecycle outcome for one candidate token.
+
+    ``status`` is one of:
+        "rejected_safety" safety gate failed; entry never evaluated
+        "no_entry"        safety passed but entry was WAIT/SKIP; no position
+        "entered"         safety + BUY; a position was opened and the loop ran
+    """
+
+    mint_address: str
+    status: str
+    safety_report: Optional[SafetyReport] = None
+    entry_decision: Optional[EntryDecision] = None
+    position: Optional[Position] = None
+    loop_outcomes: List[Optional[LoopOutcome]] = field(default_factory=list)
+
+
+async def _default_safety_checker(mint_address: str) -> SafetyReport:
+    """Default gate: the live read-only safety / rug check."""
+    return await evaluate_token_safety(mint_address)
+
+
+async def evaluate_and_trade(
+    mint_address: str,
+    entry_market: EntryMarketData,
+    *,
+    max_iterations: int,
+    dry_run: bool = True,
+    safety_checker: SafetyChecker = _default_safety_checker,
+    snapshot_provider: SnapshotProvider = mock_market_snapshot,
+) -> TradeSession:
+    """Run the full candidate pipeline: safety gate -> entry -> manage loop.
+
+    Order (every gate fail-closed; nothing is signed or broadcast):
+
+        1. Safety gate FIRST. If ``evaluate_token_safety`` does not pass, log
+           and SKIP — the token never reaches entry and no position is opened.
+        2. Entry decision. Only a BUY opens a position; WAIT/SKIP open nothing.
+        3. On BUY, hand the sized :class:`Position` to :func:`run_loop`, which
+           manages it with the mandated hard-exit-first priority.
+
+    Returns a :class:`TradeSession` describing how far the candidate got.
+    """
+    # --- 1. Safety gate FIRST ----------------------------------------------
+    report = await safety_checker(mint_address)
+    if not report.passed:
+        logger.warning(
+            "[trade] %s SKIP — failed safety gate (%s); entry not evaluated",
+            mint_address,
+            "; ".join(report.reasons) or "unsafe",
+        )
+        return TradeSession(
+            mint_address=mint_address,
+            status="rejected_safety",
+            safety_report=report,
+        )
+
+    logger.info("[trade] %s passed safety gate -> evaluating entry", mint_address)
+
+    # --- 2. Entry decision: only BUY opens a position ----------------------
+    decision = await evaluate_entry(mint_address, entry_market, dry_run=dry_run)
+    if decision.action is not EntryAction.BUY:
+        logger.info(
+            "[trade] %s no position opened (entry=%s: %s)",
+            mint_address,
+            decision.action.value,
+            decision.reason,
+        )
+        return TradeSession(
+            mint_address=mint_address,
+            status="no_entry",
+            safety_report=report,
+            entry_decision=decision,
+        )
+
+    # --- 3. BUY: open the position and manage it in the loop ---------------
+    position = decision.position
+    assert position is not None  # guaranteed on a BUY decision
+    logger.info(
+        "[trade] %s ENTER — opened position size=%.6f @ %.8f (entry_liq=%.2f)",
+        mint_address,
+        position.original_size,
+        position.entry_price,
+        decision.entry_liquidity,
+    )
+    outcomes = await run_loop(
+        position,
+        token_address=mint_address,
+        entry_liquidity=decision.entry_liquidity,
+        max_iterations=max_iterations,
+        dry_run=dry_run,
+        snapshot_provider=snapshot_provider,
+    )
+    return TradeSession(
+        mint_address=mint_address,
+        status="entered",
+        safety_report=report,
+        entry_decision=decision,
+        position=position,
+        loop_outcomes=outcomes,
+    )
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments.
 
@@ -239,29 +358,53 @@ def main() -> None:
     if not args.dry_run:
         logger.info("[startup] LIVE mode requested — trading logic not implemented yet.")
 
-    # Demo run against the no-network mock feed so the loop exercises end-to-end.
-    # TODO: replace the scenario provider with data.market_feed.get_market_snapshot
-    # (real Dexscreener/Birdeye/Helius) once the data stream is wired up.
-    demo_position = Position(entry_price=0.001, original_size=1000.0)
+    # Demo run against no-network mocks so the WHOLE chain exercises end-to-end:
+    # safety gate -> entry decision -> (on BUY) the managed loop.
+    # TODO: replace the mock safety gather, demo entry market, and scenario
+    # provider with the real data stream (Dexscreener/Birdeye/Helius) once wired.
+    async def demo_safety_checker(mint: str) -> SafetyReport:
+        return await evaluate_token_safety(mint, data_gatherer=mock_safe_token_data)
+
+    demo_entry_price = 0.001
     entry_liquidity = 100_000.0
+    # A BUY-eligible candidate: proven runner (ATH 5h ago, 10x volume spike),
+    # ~40% pullback, stabilised — so the demo reaches the loop.
+    now = time.time()
+    demo_market = EntryMarketData(
+        current_price=demo_entry_price * 0.60,
+        ath_price=demo_entry_price,
+        ath_timestamp=now - 5 * 3600.0,
+        price_history=[
+            demo_entry_price * m
+            for m in (1.0, 0.9, 0.75, 0.62, 0.61, 0.60, 0.605, 0.60)
+        ],
+        volume_history=[100.0, 100.0, 100.0, 100.0, 1000.0],
+        current_liquidity=entry_liquidity,
+        pre_dip_liquidity=entry_liquidity * 1.1,
+        now=now,
+    )
+    # The loop manages the opened position along the chosen scenario path.
     provider = make_scenario_provider(
         args.scenario,
-        entry_price=demo_position.entry_price,
+        entry_price=demo_entry_price * 0.60,
         entry_liquidity=entry_liquidity,
     )
     logger.info("[startup] scenario=%s", args.scenario)
-    outcomes = asyncio.run(
-        run_loop(
-            demo_position,
-            token_address="DEMO_MINT",
-            entry_liquidity=entry_liquidity,
+    session = asyncio.run(
+        evaluate_and_trade(
+            "DEMO_MINT",
+            demo_market,
             max_iterations=args.iterations,
             dry_run=args.dry_run,
+            safety_checker=demo_safety_checker,
             snapshot_provider=provider,
         )
     )
     logger.info(
-        "[shutdown] ran %d iterations (scenario=%s)", len(outcomes), args.scenario
+        "[shutdown] status=%s ran %d loop iterations (scenario=%s)",
+        session.status,
+        len(session.loop_outcomes),
+        args.scenario,
     )
 
 

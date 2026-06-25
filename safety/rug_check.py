@@ -641,6 +641,9 @@ async def mock_safe_token_data(mint_address: str) -> Dict[str, Any]:
     Lets the safety check run end-to-end before real providers are wired.
     """
     return {
+        "rugged": False,
+        "score_normalised": 5.0,   # well below MAX_RISK_SCORE
+        "risk_flags": [],          # no high-severity risks
         "lp_locked_or_burned": True,
         "lp_lock_detail": "LP burned (100%)",
         "buy_tax_pct": 0.0,
