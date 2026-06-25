@@ -15,14 +15,19 @@ mainnet-beta.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Awaitable, Callable, List, Optional
 
 import config
+from data.market_feed import mock_market_snapshot
 from strategies import hard_exit, profit_taking
 from strategies.hard_exit import ExitDecision, MarketData
 from strategies.profit_taking import Position, SellAction
+
+# Async source that yields a snapshot (or None, fail-closed) for a token.
+SnapshotProvider = Callable[[str, float], Awaitable[Optional[MarketData]]]
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +95,60 @@ async def process_position(
     return LoopOutcome(path="hold")
 
 
+async def run_loop(
+    position: Position,
+    token_address: str,
+    entry_liquidity: float,
+    *,
+    max_iterations: int,
+    dry_run: bool = True,
+    interval: float = 0.0,
+    snapshot_provider: SnapshotProvider = mock_market_snapshot,
+) -> List[Optional[LoopOutcome]]:
+    """Run the trading loop for a bounded number of iterations.
+
+    Each iteration: fetch a snapshot, SKIP on ``None`` (fail-closed — never
+    trade on incomplete data), otherwise evaluate via :func:`process_position`.
+    Returns one entry per iteration (``None`` for a skipped/fail-closed tick).
+
+    ``max_iterations`` bounds the loop so it never runs forever. The loop stops
+    early once a hard exit fires, since the position is then fully closed.
+    ``snapshot_provider`` is injectable for testing; it defaults to the
+    no-network mock source.
+    """
+    outcomes: List[Optional[LoopOutcome]] = []
+
+    for i in range(max_iterations):
+        snapshot = await snapshot_provider(token_address, entry_liquidity)
+
+        if snapshot is None:
+            logger.warning(
+                "[loop %d/%d] no snapshot (fail-closed) -> SKIP, no trade",
+                i + 1,
+                max_iterations,
+            )
+            outcomes.append(None)
+        else:
+            outcome = await process_position(position, snapshot, dry_run=dry_run)
+            logger.info(
+                "[loop %d/%d] outcome=%s", i + 1, max_iterations, outcome.path
+            )
+            outcomes.append(outcome)
+
+            if outcome.path == "hard_exit":
+                logger.info(
+                    "[loop %d/%d] position fully exited -> stopping loop",
+                    i + 1,
+                    max_iterations,
+                )
+                break
+
+        if interval > 0:
+            await asyncio.sleep(interval)
+
+    return outcomes
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments.
 
@@ -111,6 +170,12 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="Disable dry-run and execute live transactions (explicit opt-in).",
     )
+    parser.add_argument(
+        "--iterations",
+        type=int,
+        default=5,
+        help="Number of loop iterations to run against the mock feed (default: 5).",
+    )
 
     return parser.parse_args()
 
@@ -125,8 +190,20 @@ def main() -> None:
     if not args.dry_run:
         logger.info("[startup] LIVE mode requested — trading logic not implemented yet.")
 
-    # TODO: drive process_position() from a live data feed (price, volume,
-    # liquidity, candle, wallet activity) once the data stream is wired up.
+    # Demo run against the no-network mock feed so the loop exercises end-to-end.
+    # TODO: replace mock_market_snapshot with data.market_feed.get_market_snapshot
+    # (real Dexscreener/Birdeye/Helius) once the data stream is wired up.
+    demo_position = Position(entry_price=0.001, original_size=1000.0)
+    outcomes = asyncio.run(
+        run_loop(
+            demo_position,
+            token_address="DEMO_MINT",
+            entry_liquidity=100_000.0,
+            max_iterations=args.iterations,
+            dry_run=args.dry_run,
+        )
+    )
+    logger.info("[shutdown] ran %d iterations against mock feed", len(outcomes))
 
 
 if __name__ == "__main__":
