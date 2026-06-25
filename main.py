@@ -185,7 +185,7 @@ def main() -> None:
     args = parse_args()
 
     mode = "DRY-RUN" if args.dry_run else "LIVE"
-    logger.info("[startup] mode=%s network=%s", mode, config.SOLANA_NETWORK)
+    logger.info("[startup] Helix Vector 1.0 | mode=%s network=%s", mode, config.SOLANA_NETWORK)
 
     if not args.dry_run:
         logger.info("[startup] LIVE mode requested — trading logic not implemented yet.")

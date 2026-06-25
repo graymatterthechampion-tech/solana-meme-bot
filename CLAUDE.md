@@ -1,5 +1,5 @@
 
-# Claude Code Guidelines: Solana Meme Bot
+# Claude Code Guidelines: Helix Vector 1.0
 
 ## Operational & Security Rules
 - NEVER hardcode private keys, seed phrases, or RPC secret URLs.
