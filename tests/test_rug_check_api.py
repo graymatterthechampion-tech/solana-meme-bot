@@ -50,10 +50,10 @@ def rugcheck_report(
     price: float = 0.0005,
     supply: int = 10 ** 15,
     decimals: int = 6,
-    volume24h: float = 40_000.0,
-    price_change24h: float = 22.0,
     include_top_holders: bool = True,
 ) -> Dict[str, Any]:
+    # NOTE: volume / price change are NOT in the RugCheck report — they come
+    # from Dexscreener now (see dexscreener_payload).
     report: Dict[str, Any] = {
         "tokenProgram": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
         "rugged": rugged,
@@ -69,8 +69,6 @@ def rugcheck_report(
         "transferFee": {"pct": tax_pct},
         "price": price,
         "markets": [{"lp": {"lpLockedPct": lp_locked_pct, "lpLockedUSD": 25_000.0}}],
-        "volume24h": volume24h,
-        "priceChange24h": price_change24h,
     }
     if include_top_holders:
         report["topHolders"] = (
@@ -80,6 +78,23 @@ def rugcheck_report(
             default_known_accounts() if known_accounts is None else known_accounts
         )
     return report
+
+
+# --- Dexscreener fixture (volume / price change) -----------------------------
+
+def dexscreener_payload(
+    *,
+    volume: float = 40_000.0,
+    price_change: float = 22.0,
+    omit_volume: bool = False,
+    no_pairs: bool = False,
+) -> Dict[str, Any]:
+    if no_pairs:
+        return {"pairs": []}
+    pair: Dict[str, Any] = {"volume": {}, "priceChange": {"h24": price_change}}
+    if not omit_volume:
+        pair["volume"]["h24"] = volume
+    return {"pairs": [pair]}
 
 
 # --- Helius (fallback) mock helpers ------------------------------------------
@@ -106,13 +121,21 @@ def make_handler(
     rug_status_sequence: Optional[List[int]] = None,
     rug_raises: Optional[Exception] = None,
     helius_error: bool = False,
+    dex_json: Optional[Dict[str, Any]] = None,
+    dex_raises: Optional[Exception] = None,
 ) -> Callable[[httpx.Request], httpx.Response]:
     rug_json = rugcheck_report() if rug_json is None else rug_json
     accounts = default_accounts() if accounts is None else accounts
+    dex_json = dexscreener_payload() if dex_json is None else dex_json
     state = {"rug_call": 0}
 
     def handler(request: httpx.Request) -> httpx.Response:
         url = str(request.url)
+
+        if "dexscreener.com" in url:
+            if dex_raises is not None:
+                raise dex_raises
+            return httpx.Response(200, json=dex_json)
 
         if "rugcheck.xyz" in url:
             # Assert RugCheck is called WITHOUT an auth header.
@@ -165,7 +188,8 @@ def evaluate(handler) -> rug_check.SafetyReport:
 
 # --- Tests -------------------------------------------------------------------
 
-def test_clean_token_passes_with_real_schema() -> None:
+def test_clean_token_passes_end_to_end_with_dexscreener_volume() -> None:
+    # Volume now comes from Dexscreener; clean token passes EVERY check.
     report = evaluate(make_handler())
     assert report.passed is True
     assert report.reasons == []
@@ -173,8 +197,35 @@ def test_clean_token_passes_with_real_schema() -> None:
     assert report.tax_pct == pytest.approx(0.0)
     # Pool (AMM) and system address excluded -> only the 5 real holders (10%).
     assert report.top10_holder_pct == pytest.approx(10.0)
-    # mcap = 1e9 ui-supply * 0.0005 = 500k; ratio = 40k / 500k = 0.08.
+    # mcap = 1e9 ui-supply * 0.0005 = 500k; Dexscreener volume 40k -> 0.08.
     assert report.volume_to_mcap_ratio == pytest.approx(0.08)
+    assert report.farmed_volume_flag is False
+
+
+def test_dexscreener_failure_fails_farmed_check_closed() -> None:
+    # Dexscreener errors -> no volume -> farmed-volume check fails closed.
+    report = evaluate(make_handler(dex_raises=httpx.TimeoutException("timed out")))
+    assert report.passed is False
+    assert report.farmed_volume_flag is True
+    assert any("volume check failed" in r for r in report.reasons)
+
+
+def test_dexscreener_omits_volume_fails_closed() -> None:
+    # Dexscreener responds but without an h24 volume -> farmed fails closed.
+    report = evaluate(make_handler(dex_json=dexscreener_payload(omit_volume=True)))
+    assert report.passed is False
+    assert report.farmed_volume_flag is True
+    assert any("volume check failed" in r for r in report.reasons)
+
+
+def test_farmed_volume_detected_high_vol_flat_price() -> None:
+    # High volume vs mcap (ratio >= 1) with a flat price -> farmed flag fires.
+    dex = dexscreener_payload(volume=1_000_000.0, price_change=1.0)
+    report = evaluate(make_handler(dex_json=dex))
+    assert report.passed is False
+    assert report.farmed_volume_flag is True
+    assert report.volume_to_mcap_ratio == pytest.approx(2.0)
+    assert any("farmed volume" in r for r in report.reasons)
 
 
 def test_rugged_flag_fails_immediately() -> None:

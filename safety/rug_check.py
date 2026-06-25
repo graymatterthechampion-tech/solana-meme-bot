@@ -13,21 +13,20 @@ every field, plus a reason. A token is never reported safe on incomplete data.
 
 DATA SOURCES (read-only)
 ------------------------
-``_gather_token_data`` pulls from two public providers via httpx:
-    * RugCheck public API — LP lock/burn status, transfer tax, market cap,
-      and (best-effort) 24h volume / price change.
+``_gather_token_data`` pulls from public providers via httpx (no keys except
+the optional Helius RPC from .env):
+    * RugCheck public API — rugged flag, risk score/flags, LP lock/burn,
+      transfer tax, holder distribution (knownAccounts-aware), market cap.
+    * Dexscreener token API — 24h volume / price change for farmed-volume.
     * Helius RPC (``config.RPC_URL`` or ``config.HELIUS_API_KEY`` from .env) —
-      ``getTokenLargestAccounts`` + ``getTokenSupply`` for holder distribution.
+      holder-distribution fallback when RugCheck topHolders are absent.
 Each provider is fetched independently and defensively: if one call errors,
 times out, is rate-limited, or omits a field, only the checks that depend on it
 fail closed — the others still evaluate.
 
-TODO(real-apis): two signals are not reliably available from RugCheck+Helius
-alone and currently fail closed when their inputs are absent:
-    * funding-source clustering needs per-holder funding history (e.g. Helius
-      enhanced tx history) — ``funded_by`` is left ``None`` for now.
-    * farmed-volume needs a dependable 24h volume/price feed (e.g. Dexscreener
-      or Birdeye) if RugCheck does not return ``volume24h``/``priceChange24h``.
+TODO(real-apis): funding-source clustering still needs per-holder funding
+history (e.g. Helius enhanced tx history); ``funded_by`` is left ``None`` for
+now, so that signal is not yet evidenced.
 """
 
 from __future__ import annotations
@@ -63,6 +62,7 @@ SYSTEM_ADDRESS: str = "11111111111111111111111111111111"
 # --- Read-only data providers -----------------------------------------------
 RUGCHECK_BASE: str = "https://api.rugcheck.xyz/v1"
 HELIUS_MAINNET_BASE: str = "https://mainnet.helius-rpc.com"
+DEXSCREENER_BASE: str = "https://api.dexscreener.com/latest/dex"  # no API key
 
 # Rate-limit / transient-error handling (module globals so tests can zero them).
 RATE_LIMIT_MAX_RETRIES: int = 3
@@ -464,20 +464,8 @@ def _parse_rugcheck(data: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:  # noqa: BLE001
         logger.debug("rugcheck mcap parse failed", exc_info=True)
 
-    # 24h volume / price change: NOT part of the standard RugCheck report, so
-    # these are best-effort and normally fail closed (farmed-volume check) until
-    # a volume feed (e.g. Dexscreener) is wired in. See module TODO.
-    try:
-        if data.get("volume24h") is not None:
-            out["volume_24h_usd"] = float(data["volume24h"])
-    except Exception:  # noqa: BLE001
-        logger.debug("rugcheck volume parse failed", exc_info=True)
-    try:
-        if data.get("priceChange24h") is not None:
-            out["price_change_24h_pct"] = float(data["priceChange24h"])
-    except Exception:  # noqa: BLE001
-        logger.debug("rugcheck price-change parse failed", exc_info=True)
-
+    # NOTE: 24h volume / price change are NOT in the RugCheck report — they come
+    # from Dexscreener (see _fetch_dexscreener), merged in during gathering.
     return out
 
 
@@ -496,6 +484,52 @@ async def _fetch_rugcheck(
         logger.warning("[rug_check] RugCheck fetch failed for %s: %s", mint_address, exc)
         return {}
     return _parse_rugcheck(data)
+
+
+def _parse_dexscreener(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Map a Dexscreener token response into raw volume / price-change fields.
+
+    Uses the most active pair (highest 24h volume). Absent/malformed fields are
+    omitted so the farmed-volume check fails closed downstream.
+    """
+    out: Dict[str, Any] = {}
+    try:
+        pairs = data.get("pairs") or []
+        if pairs:
+            best = max(
+                pairs,
+                key=lambda p: float((p.get("volume") or {}).get("h24") or 0.0),
+            )
+            vol = (best.get("volume") or {}).get("h24")
+            if vol is not None:
+                out["volume_24h_usd"] = float(vol)
+            change = (best.get("priceChange") or {}).get("h24")
+            if change is not None:
+                out["price_change_24h_pct"] = float(change)
+    except Exception:  # noqa: BLE001
+        logger.debug("dexscreener parse failed", exc_info=True)
+    return out
+
+
+async def _fetch_dexscreener(
+    client: httpx.AsyncClient, mint_address: str, *, timeout: float
+) -> Dict[str, Any]:
+    """Fetch 24h volume / price change from Dexscreener. Returns {} on failure.
+
+    Dexscreener's token endpoint is public — no API key. On any error, timeout,
+    rate-limit, or missing field this returns {}, leaving the farmed-volume
+    check to fail closed.
+    """
+    url = f"{DEXSCREENER_BASE}/tokens/{mint_address}"
+    try:
+        data = await _request_json(
+            client, "GET", url, headers={"Accept": "application/json"},
+            timeout=timeout, label="dexscreener",
+        )
+    except Exception as exc:  # noqa: BLE001 — any error -> omit, fail-closed
+        logger.warning("[rug_check] Dexscreener fetch failed for %s: %s", mint_address, exc)
+        return {}
+    return _parse_dexscreener(data)
 
 
 async def _fetch_helius_holders(
@@ -542,18 +576,22 @@ async def _gather_token_data(
     *,
     timeout: float,
 ) -> Dict[str, Any]:
-    """Read-only gather from RugCheck (primary) with Helius holder fallback.
+    """Read-only gather from RugCheck (primary) + Dexscreener (volume), with a
+    Helius holder fallback.
 
-    RugCheck supplies rugged/risk/LP/tax/holders/mcap. Holders come from its
+    RugCheck supplies rugged/risk/LP/tax/holders/mcap. Dexscreener supplies 24h
+    volume / price change (RugCheck has neither). Holders come from RugCheck's
     knownAccounts-aware topHolders; only if those are absent do we fall back to
     Helius getTokenLargestAccounts (lower fidelity — cannot label pools). Each
     provider is fetched independently and never raises here: a failed provider
     omits its fields so only the dependent checks fail closed.
     """
     raw = dict(await _fetch_rugcheck(client, mint_address, timeout=timeout))
+    # 24h volume / price action (RugCheck does not provide it).
+    raw.update(await _fetch_dexscreener(client, mint_address, timeout=timeout))
+    # Holder fallback to Helius only if RugCheck topHolders were absent.
     if "holders" not in raw:
-        helius = await _fetch_helius_holders(client, mint_address, timeout=timeout)
-        raw.update(helius)
+        raw.update(await _fetch_helius_holders(client, mint_address, timeout=timeout))
     return raw
 
 
