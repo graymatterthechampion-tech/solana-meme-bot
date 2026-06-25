@@ -1,47 +1,46 @@
--  # Claude Code Guidelines: Solana Meme Bot
+
+# Claude Code Guidelines: Solana Meme Bot
 
 ## Operational & Security Rules
-- NEVER hardcode private keys, seed phrases, or RPC secret URLs. 
-- Use environment variables (`process.env` or `dotenv`) for all sensitive credentials.
-- Ensure all file paths containing keys (e.g., `*.json`, `.env`) are strictly added to `.gitignore`.
+- NEVER hardcode private keys, seed phrases, or RPC secret URLs.
+- Use environment variables (`os.environ` / `python-dotenv`) for all sensitive credentials.
+- Ensure all key files (e.g., `*keypair.json`, `wallet.json`, `.env`) are strictly added to `.gitignore`.
 - Before executing any live network commands, confirm whether the target is `devnet` or `mainnet-beta`.
+- All strategy modules default to dry-run; live execution requires an explicit flag.
 
 ## Technical Stack & Frameworks
-- **Language**: python
-- **Solana Libraries**: `@solana/web3.js` (v1.x legacy or v2.x web3, stick to existing package signatures) and `@solana/spl-token`.
-- **DEX Protocols**: Raydiu m AMM (V4/Clmm), Jupiter AG API (V6) for swaps and routing, or Pump.fun bonding curves.
+- **Language**: Python 3.10+ (asynchronous)
+- **Solana Libraries**: `solana` (solana-py) and `solders` (instructions, transactions, types).
+- **APIs**: Jupiter V6 HTTP API (via `httpx` or `aiohttp`); Raydium / Pump.fun integrations as needed.
 
 ## Code Style & Architecture
-- **Transaction Safety**: Always implement robust retry logic with exponential backoff for transaction broadcasting.
-- **Slippage & Priority Fees**: Explicitly calculate dynamic Compute Budget priority fees (`ComputeBudgetProgram.setComputeUnitPrice`) to avoid stuck transactions. Handle max slippage protection safely.
-- **Error Handling**: Use aggressive `try/catch` blocks around RPC network calls. Log clear decoded error messages, not just raw anchor/program hex codes.
+- **Async First**: Use `async/await` for all RPC requests and API fetching to avoid blocking the trading loop.
+- **Type Hinting**: Use explicit type hints (`from typing import Optional, Dict`, etc.).
+- **Transaction Safety**: Implement robust retry logic with exponential backoff for transaction broadcasting.
+- **Slippage & Priority Fees**: Calculate dynamic priority fees; enforce strict max-slippage protection.
+- **Error Handling**: Catch `SolanaException` and `RpcException` explicitly. Log clear decoded error messages, not raw hex codes.
 
-## Test & Build Commands
-- Build project: `npm run build` or `tsc`
-- Run bot in dry-run mode: `npm run dev:dry`
-- Execute test suite: `npm test`
-"Implement a clean TypeScript module that interacts with the Jupiter V6 API to swap SOL for a specified mint address. Ensure the module calculates dynamic priority fees using the latest blockhash, sets a 1% slippage guardrail, and exports a reusable function. Follow the safety rules in CLAUDE.md."
-"Create a simulation wrapper for our buy/sell execution logic. It should read live token pools and prices via RPC, but instead of signing and broadcasting the actual transaction, it should log a detailed 'Dry Run Success' breakdown showing expected tokens bought, fees paid, and simulated slippage. Do not expose any private keys."
-"Write an asynchronous listener script using a WebSocket connection (onLogsoronProgramAccountChange) to detect when a new token market is created on Raydium. Parse the transaction log to extract the new token mint address and pass it to our log framework."
-# 1. Ensure your environment files are hidden from Claude's accidental file reads
-echo ".env" >> .gitignore
-echo "*keypair.json" >> .gitignore
+## Trading Strategy Principles
+- Each strategy is a separate module under `strategies/`.
+- **Profit-taking** (fires each tier once): at >=2x sell 50% of original, at >=5x sell 25% of original, at >=10x sell 15% of original, retain a 10% moonbag.
+- **Hard exits** (sell entire remaining position, moonbag included) trigger on: volume below 20% of peak 5m volume, liquidity below 70% of entry liquidity, or a single sell exceeding 5% of pool liquidity.
+- **Priority rule**: hard-exit checks run BEFORE profit-taking in the main loop. If a hard exit fires, exit fully and skip profit logic.
 
-# 2. Launch Claude with your prompt directly
-claude "Review my current package.json and outline the architecture for our Solana trading bot"
-"Create a simulation wrapper for our buy/sell execution logic in Python. The script should use AsyncClient from the solana.rpc.async_apipackage to fetch live pool data and prices. Instead of signing and broadcasting an actual transaction usingKeypair, it must intercept the logic before the send step. Log a structured, detailed 'Dry Run Success' dictionary or printout showing: expected tokens bought, exact lamports/fees paid, and simulated slippage. Follow the security and environment guardrails in CLAUDE.md."
-## Technical Stack & Frameworks
-- **Language**: Python 3.10+ (Asynchronous)
-- **Solana Libraries**: `solana` (solana-py) and `solders` (for instructions, transactions, and types).
-- **APIs**: Jupiter V6 HTTP API (via `httpx` or `aiohttp`) or Raydium Python integrations.
-
-## Code Style & Architecture
-- **Async First**: Always use `async/await` syntax for RPC requests and API fetching to prevent blocking the trading loop.
-- **Type Hinting**: Use explicit Python type hints (`from typing import Optional, Dict`, etc.).
-- **Error Handling**: Catch `SolanaException` and `RpcException` explicitly.
+## MEV / Sandwich Protection
+- Enforce strict slippage caps on every swap (default 1%); reject fills exceeding the cap.
+- Use dynamic priority fees; consider Jito bundle submission for entries on contested launches.
+- Prefer smaller position sizes on low-liquidity pools to reduce attack surface.
 
 ## Test & Build Commands
 - Run bot simulation: `python main.py --dry-run`
 - Run test suite: `pytest`
-- Format check: `black .` or `flake8`
- 
+- Format / lint check: `black .` or `flake8`
+## 4. WORKFLOW & INITIAL TASK
+We will build Railgun Algo using a strict step-by-step workflow. 
+
+Before writing any code or initializing files, your first task is to:
+1. Acknowledge these execution-level guardrails and confirm you understand the multi-layered scope of Railgun Algo.
+2. Recommend the optimal tech stack for an execution bot (e.g., Node.js/TypeScript for orchestration, or Rust if required for critical parsing speeds) and the best RPC connection methods (such as Helius or QuickNode).
+3. Provide a high-level file tree architecture map showing exactly how the data stream feeds into the parser, triggers the router, passes through the risk controller, and reaches the signer.
+
+Do not generate code blocks or transaction handlers yet. Present the structural blueprint first and ask for my approval to begin.
