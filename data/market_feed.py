@@ -34,7 +34,7 @@ slippage caps in CLAUDE.md are actually exercised.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 
@@ -175,3 +175,104 @@ async def mock_market_snapshot(
         "candle_1m_close": 0.0015,
     }
     return _build_snapshot(raw, entry_liquidity)
+
+
+# --- Scenario mode ----------------------------------------------------------
+# Scripted market paths for exercising the loop end-to-end without real data.
+
+SCENARIOS: tuple = ("flat", "pump", "rug", "dump")
+
+# Async provider matching main.run_loop's snapshot_provider contract.
+ScenarioProvider = Callable[[str, float], Awaitable[Optional[MarketData]]]
+
+
+def _make_snapshot(
+    entry_liquidity: float,
+    price: float,
+    *,
+    liquidity: Optional[float] = None,
+    volume_15m: float = 50_000.0,
+    peak_volume_15m: float = 50_000.0,
+    largest_single_sell: float = 0.0,
+    top_wallet_sells: int = 0,
+    candle_open: Optional[float] = None,
+    candle_close: Optional[float] = None,
+) -> MarketData:
+    """Build one validated snapshot. Defaults are hard-exit-healthy; the caller
+    perturbs only the dimension a given scenario step needs to exercise."""
+    raw: Dict[str, Any] = {
+        "price": price,
+        "volume_15m": volume_15m,
+        "peak_volume_15m": peak_volume_15m,
+        "liquidity": entry_liquidity if liquidity is None else liquidity,
+        "largest_single_sell": largest_single_sell,
+        "top_wallet_sells": top_wallet_sells,
+        "candle_1m_open": price if candle_open is None else candle_open,
+        "candle_1m_close": price if candle_close is None else candle_close,
+    }
+    return _build_snapshot(raw, entry_liquidity)
+
+
+def _scenario_snapshots(
+    name: str, entry_price: float, entry_liquidity: float
+) -> List[MarketData]:
+    """Return the scripted snapshot sequence for a scenario."""
+    healthy_price = entry_price * 1.5
+
+    if name == "flat":
+        # Steady price ~1.5x: no hard exit, no profit tier -> HOLD (default).
+        return [_make_snapshot(entry_liquidity, healthy_price)]
+
+    if name == "pump":
+        # Climb through 2x, 5x, 10x to exercise every profit-taking tier.
+        return [
+            _make_snapshot(entry_liquidity, entry_price * 2),
+            _make_snapshot(entry_liquidity, entry_price * 5),
+            _make_snapshot(entry_liquidity, entry_price * 10),
+        ]
+
+    if name == "rug":
+        # Liquidity drops below 70% of entry -> hard-exit liquidity_drop.
+        return [
+            _make_snapshot(entry_liquidity, entry_price * 1.2),
+            _make_snapshot(
+                entry_liquidity, entry_price * 1.2, liquidity=entry_liquidity * 0.6
+            ),
+        ]
+
+    if name == "dump":
+        # Price crashes ~75% within one 1m candle -> hard-exit flash_crash.
+        return [
+            _make_snapshot(entry_liquidity, healthy_price),
+            _make_snapshot(
+                entry_liquidity,
+                healthy_price * 0.25,
+                candle_open=healthy_price,
+                candle_close=healthy_price * 0.25,
+            ),
+        ]
+
+    raise ValueError(f"unknown scenario {name!r}; expected one of {SCENARIOS}")
+
+
+def make_scenario_provider(
+    name: str,
+    entry_price: float,
+    entry_liquidity: float = 100_000.0,
+) -> ScenarioProvider:
+    """Build a stateful async provider that yields a scenario's snapshots in
+    order over successive calls, then holds the final snapshot once exhausted.
+
+    The returned callable matches ``main.run_loop``'s ``snapshot_provider``
+    contract: ``async (token_address, entry_liquidity) -> MarketData``.
+    """
+    snapshots = _scenario_snapshots(name, entry_price, entry_liquidity)
+    state = {"step": 0}
+
+    async def provider(token_address: str, entry_liq: float) -> Optional[MarketData]:
+        idx = min(state["step"], len(snapshots) - 1)
+        state["step"] += 1
+        return snapshots[idx]
+
+    provider.__name__ = f"scenario_{name}"
+    return provider

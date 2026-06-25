@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Awaitable, Callable, List, Optional
 
 import config
-from data.market_feed import mock_market_snapshot
+from data.market_feed import SCENARIOS, make_scenario_provider, mock_market_snapshot
 from strategies import hard_exit, profit_taking
 from strategies.hard_exit import ExitDecision, MarketData
 from strategies.profit_taking import Position, SellAction
@@ -177,6 +177,12 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="Number of loop iterations to run against the mock feed (default: 5).",
     )
+    parser.add_argument(
+        "--scenario",
+        choices=SCENARIOS,
+        default="flat",
+        help="Scripted market path to feed the loop (default: flat).",
+    )
 
     return parser.parse_args()
 
@@ -234,19 +240,29 @@ def main() -> None:
         logger.info("[startup] LIVE mode requested — trading logic not implemented yet.")
 
     # Demo run against the no-network mock feed so the loop exercises end-to-end.
-    # TODO: replace mock_market_snapshot with data.market_feed.get_market_snapshot
+    # TODO: replace the scenario provider with data.market_feed.get_market_snapshot
     # (real Dexscreener/Birdeye/Helius) once the data stream is wired up.
     demo_position = Position(entry_price=0.001, original_size=1000.0)
+    entry_liquidity = 100_000.0
+    provider = make_scenario_provider(
+        args.scenario,
+        entry_price=demo_position.entry_price,
+        entry_liquidity=entry_liquidity,
+    )
+    logger.info("[startup] scenario=%s", args.scenario)
     outcomes = asyncio.run(
         run_loop(
             demo_position,
             token_address="DEMO_MINT",
-            entry_liquidity=100_000.0,
+            entry_liquidity=entry_liquidity,
             max_iterations=args.iterations,
             dry_run=args.dry_run,
+            snapshot_provider=provider,
         )
     )
-    logger.info("[shutdown] ran %d iterations against mock feed", len(outcomes))
+    logger.info(
+        "[shutdown] ran %d iterations (scenario=%s)", len(outcomes), args.scenario
+    )
 
 
 if __name__ == "__main__":
