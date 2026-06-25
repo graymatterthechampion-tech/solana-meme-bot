@@ -11,17 +11,29 @@ Safety is asserted, never assumed. On any error, timeout, or missing field the
 report is returned with ``passed=False`` and a conservative (unsafe) value for
 every field, plus a reason. A token is never reported safe on incomplete data.
 
-TODO(real-apis): wire read-only providers in ``_gather_token_data``:
-    * Helius RPC (``config.RPC_URL`` / ``config.HELIUS_API_KEY``) —
-      ``getTokenLargestAccounts``, account funding history for clustering.
-    * RugCheck / GoPlus token-security — LP lock/burn status, buy/sell tax,
-      mint/freeze authority, honeypot sellability.
-    * Birdeye / Dexscreener — 24h volume, market cap, price action for the
-      farmed-volume heuristic.
+DATA SOURCES (read-only)
+------------------------
+``_gather_token_data`` pulls from two public providers via httpx:
+    * RugCheck public API — LP lock/burn status, transfer tax, market cap,
+      and (best-effort) 24h volume / price change.
+    * Helius RPC (``config.RPC_URL`` or ``config.HELIUS_API_KEY`` from .env) —
+      ``getTokenLargestAccounts`` + ``getTokenSupply`` for holder distribution.
+Each provider is fetched independently and defensively: if one call errors,
+times out, is rate-limited, or omits a field, only the checks that depend on it
+fail closed — the others still evaluate.
+
+TODO(real-apis): two signals are not reliably available from RugCheck+Helius
+alone and currently fail closed when their inputs are absent:
+    * funding-source clustering needs per-holder funding history (e.g. Helius
+      enhanced tx history) — ``funded_by`` is left ``None`` for now.
+    * farmed-volume needs a dependable 24h volume/price feed (e.g. Dexscreener
+      or Birdeye) if RugCheck does not return ``volume24h``/``priceChange24h``.
 """
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -37,9 +49,25 @@ MAX_TAX_PCT: float = 1.0          # fail if buy/sell tax >= 1%
 MAX_TOP10_PCT: float = 15.0       # fail if top-10 holders own >= 15%
 FARMED_VOL_RATIO: float = 1.0     # 24h volume >= market cap is suspicious...
 FARMED_FLAT_PRICE_PCT: float = 5.0  # ...when 24h price moved <= 5% (flat)
-DEFAULT_TIMEOUT: float = 5.0      # read-only request timeout (seconds)
+LP_LOCK_MIN_PCT: float = 95.0     # treat LP as locked/burned at >= 95%
+MAX_RISK_SCORE: float = 40.0      # fail if RugCheck score_normalised exceeds this (lower = safer)
+DEFAULT_TIMEOUT: float = 8.0      # read-only request timeout (seconds)
 
-_PLACEHOLDER_BASE: str = "https://example.invalid/safety"
+# RugCheck risk levels considered high-severity (any one fails the token).
+HIGH_RISK_LEVELS: frozenset = frozenset({"danger", "high", "critical"})
+# topHolders whose owner is one of these knownAccounts types (or the system
+# address) are pools/lockers, not real whales — excluded from concentration.
+KNOWN_OWNER_EXCLUDE_TYPES: frozenset = frozenset({"AMM", "LOCKER"})
+SYSTEM_ADDRESS: str = "11111111111111111111111111111111"
+
+# --- Read-only data providers -----------------------------------------------
+RUGCHECK_BASE: str = "https://api.rugcheck.xyz/v1"
+HELIUS_MAINNET_BASE: str = "https://mainnet.helius-rpc.com"
+
+# Rate-limit / transient-error handling (module globals so tests can zero them).
+RATE_LIMIT_MAX_RETRIES: int = 3
+RATE_LIMIT_BACKOFF: float = 0.5   # base seconds; exponential per attempt
+RETRY_AFTER_MAX: float = 10.0     # cap any server-provided Retry-After
 
 # Addresses excluded from holder-concentration math: they are not "whales".
 # TODO(addresses): expand with CEX hot wallets (Binance/Coinbase/OKX/Bybit),
@@ -116,6 +144,31 @@ def _evaluate(mint_address: str, raw: Dict[str, Any]) -> SafetyReport:
     """
     reasons: List[str] = []
 
+    # 0a. Rugged: explicit top-level kill switch — fail immediately if true.
+    try:
+        rugged = bool(_require(raw, "rugged"))
+        if rugged:
+            reasons.append("token flagged as RUGGED by RugCheck")
+    except Exception as exc:  # noqa: BLE001 — fail-closed per check
+        rugged = True
+        reasons.append(f"rugged check failed: {exc}")
+
+    # 0b. Risk gate: normalised score + any high-severity risk flag.
+    try:
+        score = float(_require(raw, "score_normalised"))
+        flags = list(_require(raw, "risk_flags"))
+        score_ok = score <= MAX_RISK_SCORE
+        if not score_ok:
+            reasons.append(
+                f"risk score {score:.1f} exceeds max {MAX_RISK_SCORE:.0f}"
+            )
+        if flags:
+            reasons.append("high-severity risks: " + ", ".join(flags))
+        risk_gate_pass = score_ok and not flags
+    except Exception as exc:  # noqa: BLE001
+        risk_gate_pass = False
+        reasons.append(f"risk gate failed: {exc}")
+
     # 1. Liquidity: LP must be locked or burned.
     try:
         lp_locked_or_burned = bool(_require(raw, "lp_locked_or_burned"))
@@ -184,9 +237,12 @@ def _evaluate(mint_address: str, raw: Dict[str, Any]) -> SafetyReport:
         farmed_volume_flag = True
         reasons.append(f"volume check failed: {exc}")
 
-    # passed only if EVERY check passes: hard checks AND no risk flags.
+    # passed only if EVERY check passes: not rugged, risk gate clear, hard
+    # checks all green, and no risk flags.
     passed = (
-        lp_locked_or_burned
+        not rugged
+        and risk_gate_pass
+        and lp_locked_or_burned
         and tax_pass
         and holder_concentration_pass
         and not funding_source_clustered
@@ -208,26 +264,297 @@ def _evaluate(mint_address: str, raw: Dict[str, Any]) -> SafetyReport:
     )
 
 
+# --- Read-only HTTP layer (rate-limit aware) --------------------------------
+
+def _helius_rpc_url() -> Optional[str]:
+    """Resolve the Helius RPC endpoint from .env via config, or None."""
+    if config.RPC_URL:
+        return config.RPC_URL
+    if config.HELIUS_API_KEY:
+        return f"{HELIUS_MAINNET_BASE}/?api-key={config.HELIUS_API_KEY}"
+    return None
+
+
+def _retry_after_seconds(resp: httpx.Response) -> Optional[float]:
+    """Parse a Retry-After header (seconds), capped, or None."""
+    raw = resp.headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        return min(float(raw), RETRY_AFTER_MAX)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _request_json(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    *,
+    json: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: float,
+    label: str,
+) -> Dict[str, Any]:
+    """Perform one read-only request with retry on 429/5xx/transient errors.
+
+    Honors a server ``Retry-After`` on 429, otherwise exponential backoff.
+    Raises on exhaustion; callers fail those checks closed.
+    """
+    last_error: Optional[Exception] = None
+
+    for attempt in range(RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            resp = await client.request(
+                method, url, json=json, headers=headers, timeout=timeout
+            )
+        except httpx.HTTPError as exc:  # timeouts, connect errors, etc.
+            last_error = exc
+            await asyncio.sleep(RATE_LIMIT_BACKOFF * (2 ** attempt))
+            continue
+
+        if resp.status_code == 429:
+            delay = _retry_after_seconds(resp)
+            if delay is None:
+                delay = RATE_LIMIT_BACKOFF * (2 ** attempt)
+            logger.warning("[rug_check] %s rate-limited (429); retry in %.2fs", label, delay)
+            last_error = httpx.HTTPStatusError(
+                "429 Too Many Requests", request=resp.request, response=resp
+            )
+            await asyncio.sleep(delay)
+            continue
+
+        if resp.status_code >= 500:
+            last_error = httpx.HTTPStatusError(
+                f"{resp.status_code} server error", request=resp.request, response=resp
+            )
+            await asyncio.sleep(RATE_LIMIT_BACKOFF * (2 ** attempt))
+            continue
+
+        resp.raise_for_status()
+        data: Dict[str, Any] = resp.json()
+        return data
+
+    raise last_error or RuntimeError(f"{label}: request failed after retries")
+
+
+async def _rpc(
+    client: httpx.AsyncClient,
+    url: str,
+    rpc_method: str,
+    params: List[Any],
+    *,
+    timeout: float,
+) -> Any:
+    """Call a read-only Solana JSON-RPC method (Helius). Raises on RPC error."""
+    payload = {"jsonrpc": "2.0", "id": 1, "method": rpc_method, "params": params}
+    data = await _request_json(
+        client, "POST", url, json=payload, timeout=timeout, label=f"helius:{rpc_method}"
+    )
+    if "error" in data:
+        raise RuntimeError(f"helius {rpc_method} error: {data['error']}")
+    return data.get("result")
+
+
+# --- Provider fetch + parse -------------------------------------------------
+
+def _parse_rugcheck(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Map a live RugCheck v1 report into raw-schema fields, defensively.
+
+    Field paths (RugCheck read endpoints need no API key):
+      * rugged       -> top-level boolean kill switch
+      * risk gate    -> score_normalised (lower = safer) + risks[].level
+      * LP lock      -> markets[0].lp.lpLockedPct / lpLockedUSD
+      * tax          -> transferFee.pct (token-2022 fee; 0 when none)
+      * holders      -> topHolders[] (pct, owner), excluding AMM/LOCKER/system
+                        owners via the knownAccounts map (so the pool/locker is
+                        not counted as a whale)
+      * market cap   -> token.supply (ui) * price
+
+    Any field that is absent/malformed is omitted so the dependent check fails
+    closed downstream rather than producing a wrong "safe".
+    """
+    out: Dict[str, Any] = {}
+
+    # Rugged: explicit top-level kill switch.
+    try:
+        if data.get("rugged") is not None:
+            out["rugged"] = bool(data["rugged"])
+    except Exception:  # noqa: BLE001
+        logger.debug("rugcheck rugged parse failed", exc_info=True)
+
+    # Risk gate: normalised score (lower = safer) + high-severity risk flags.
+    try:
+        if data.get("score_normalised") is not None:
+            out["score_normalised"] = float(data["score_normalised"])
+        risks = data.get("risks")
+        if isinstance(risks, list):
+            out["risk_flags"] = [
+                str(r.get("name") or "unknown")
+                for r in risks
+                if str(r.get("level", "")).lower() in HIGH_RISK_LEVELS
+            ]
+    except Exception:  # noqa: BLE001
+        logger.debug("rugcheck risk parse failed", exc_info=True)
+
+    # LP lock / burn: first market's lp block. lpLockedPct of 100 == fully
+    # locked/burned; lpLockedUSD enriches the human-readable detail.
+    try:
+        markets = data.get("markets") or []
+        lp = (markets[0].get("lp") or {}) if markets else {}
+        lp_pct_raw = lp.get("lpLockedPct")
+        if lp_pct_raw is not None:
+            lp_pct = float(lp_pct_raw)
+            detail = f"LP locked/burned {lp_pct:.1f}% (RugCheck"
+            locked_usd = lp.get("lpLockedUSD")
+            if locked_usd is not None:
+                detail += f", ${float(locked_usd):,.0f} locked"
+            detail += ")"
+            out["lp_locked_or_burned"] = lp_pct >= LP_LOCK_MIN_PCT
+            out["lp_lock_detail"] = detail
+    except Exception:  # noqa: BLE001
+        logger.debug("rugcheck LP parse failed", exc_info=True)
+
+    # Transfer tax: top-level transferFee.pct (token-2022 fee). When there is
+    # no fee config (token_extensions.transferFeeConfig is null), tax is 0.
+    try:
+        transfer_fee = data.get("transferFee")
+        if isinstance(transfer_fee, dict) and transfer_fee.get("pct") is not None:
+            tax = float(transfer_fee["pct"])
+            out["buy_tax_pct"] = tax
+            out["sell_tax_pct"] = tax
+        else:
+            ext = data.get("token_extensions")
+            if (
+                isinstance(ext, dict)
+                and "transferFeeConfig" in ext
+                and ext["transferFeeConfig"] is None
+            ):
+                out["buy_tax_pct"] = 0.0
+                out["sell_tax_pct"] = 0.0
+    except Exception:  # noqa: BLE001
+        logger.debug("rugcheck tax parse failed", exc_info=True)
+
+    # Holder distribution: topHolders[], EXCLUDING pool/locker/system owners
+    # (via knownAccounts) so the liquidity pool is not counted as a holder.
+    try:
+        top_holders = data.get("topHolders")
+        if isinstance(top_holders, list):
+            known = data.get("knownAccounts") or {}
+            holders: List[Dict[str, Any]] = []
+            for h in top_holders:
+                owner = h.get("owner")
+                label_type = str((known.get(owner) or {}).get("type", "")).upper()
+                if owner == SYSTEM_ADDRESS or label_type in KNOWN_OWNER_EXCLUDE_TYPES:
+                    continue
+                holders.append(
+                    {"address": owner, "pct": float(h.get("pct") or 0.0), "funded_by": None}
+                )
+            out["holders"] = holders
+    except Exception:  # noqa: BLE001
+        logger.debug("rugcheck holders parse failed", exc_info=True)
+
+    # Market cap: ui-supply * price.
+    try:
+        token = data.get("token") or {}
+        price = data.get("price")
+        if price is not None and token.get("supply") is not None:
+            ui_supply = float(token["supply"]) / (10 ** int(token.get("decimals", 0)))
+            out["market_cap_usd"] = ui_supply * float(price)
+    except Exception:  # noqa: BLE001
+        logger.debug("rugcheck mcap parse failed", exc_info=True)
+
+    # 24h volume / price change: NOT part of the standard RugCheck report, so
+    # these are best-effort and normally fail closed (farmed-volume check) until
+    # a volume feed (e.g. Dexscreener) is wired in. See module TODO.
+    try:
+        if data.get("volume24h") is not None:
+            out["volume_24h_usd"] = float(data["volume24h"])
+    except Exception:  # noqa: BLE001
+        logger.debug("rugcheck volume parse failed", exc_info=True)
+    try:
+        if data.get("priceChange24h") is not None:
+            out["price_change_24h_pct"] = float(data["priceChange24h"])
+    except Exception:  # noqa: BLE001
+        logger.debug("rugcheck price-change parse failed", exc_info=True)
+
+    return out
+
+
+async def _fetch_rugcheck(
+    client: httpx.AsyncClient, mint_address: str, *, timeout: float
+) -> Dict[str, Any]:
+    """Fetch + parse the RugCheck report. Returns {} on any failure."""
+    url = f"{RUGCHECK_BASE}/tokens/{mint_address}/report"
+    try:
+        # RugCheck read endpoints are public — NO API key / auth header.
+        data = await _request_json(
+            client, "GET", url, headers={"Accept": "application/json"},
+            timeout=timeout, label="rugcheck",
+        )
+    except Exception as exc:  # noqa: BLE001 — any error -> omit, fail-closed
+        logger.warning("[rug_check] RugCheck fetch failed for %s: %s", mint_address, exc)
+        return {}
+    return _parse_rugcheck(data)
+
+
+async def _fetch_helius_holders(
+    client: httpx.AsyncClient, mint_address: str, *, timeout: float
+) -> Dict[str, Any]:
+    """Fetch holder distribution via Helius RPC. Returns {} on any failure.
+
+    Uses getTokenLargestAccounts + getTokenSupply (both read-only). ``pct`` is
+    each largest account's share of total supply. ``funded_by`` is left None
+    (funding history is not fetched yet — see module TODO).
+    """
+    rpc_url = _helius_rpc_url()
+    if not rpc_url:
+        logger.warning("[rug_check] no Helius RPC configured (RPC_URL/HELIUS_API_KEY)")
+        return {}
+    try:
+        largest = await _rpc(
+            client, rpc_url, "getTokenLargestAccounts", [mint_address], timeout=timeout
+        )
+        supply = await _rpc(
+            client, rpc_url, "getTokenSupply", [mint_address], timeout=timeout
+        )
+        accounts = (largest or {}).get("value") or []
+        total_ui = float(((supply or {}).get("value") or {}).get("uiAmount") or 0.0)
+        if total_ui <= 0:
+            return {}
+        holders = [
+            {
+                "address": acct.get("address"),
+                "pct": float(acct.get("uiAmount") or 0.0) / total_ui * 100.0,
+                "funded_by": None,
+            }
+            for acct in accounts
+        ]
+        return {"holders": holders}
+    except Exception as exc:  # noqa: BLE001 — any error -> omit, fail-closed
+        logger.warning("[rug_check] Helius holder fetch failed for %s: %s", mint_address, exc)
+        return {}
+
+
 async def _gather_token_data(
     mint_address: str,
     client: httpx.AsyncClient,
     *,
     timeout: float,
 ) -> Dict[str, Any]:
-    """Read-only fetch of the raw safety payload for a mint.
+    """Read-only gather from RugCheck (primary) with Helius holder fallback.
 
-    TODO(real-apis): placeholder. Replace with the read-only providers listed
-    in the module docstring and merge their fields. Uses only HTTP GET.
+    RugCheck supplies rugged/risk/LP/tax/holders/mcap. Holders come from its
+    knownAccounts-aware topHolders; only if those are absent do we fall back to
+    Helius getTokenLargestAccounts (lower fidelity — cannot label pools). Each
+    provider is fetched independently and never raises here: a failed provider
+    omits its fields so only the dependent checks fail closed.
     """
-    headers: Dict[str, str] = {}
-    if config.HELIUS_API_KEY:
-        headers["Authorization"] = f"Bearer {config.HELIUS_API_KEY}"
-
-    url = f"{_PLACEHOLDER_BASE}/token/{mint_address}"
-    resp = await client.get(url, headers=headers, timeout=timeout)
-    resp.raise_for_status()
-    data: Dict[str, Any] = resp.json()
-    return data
+    raw = dict(await _fetch_rugcheck(client, mint_address, timeout=timeout))
+    if "holders" not in raw:
+        helius = await _fetch_helius_holders(client, mint_address, timeout=timeout)
+        raw.update(helius)
+    return raw
 
 
 async def evaluate_token_safety(
@@ -291,3 +618,52 @@ async def mock_safe_token_data(mint_address: str) -> Dict[str, Any]:
         "market_cap_usd": 500_000.0,
         "price_change_24h_pct": 22.0,
     }
+
+
+# --- CLI: `python -m safety.rug_check <mint_address>` ------------------------
+
+def _format_report(report: SafetyReport) -> str:
+    """Human-readable rendering of a SafetyReport for the CLI."""
+    verdict = "PASS (safe)" if report.passed else "FAIL (unsafe)"
+    lines = [
+        f"Token:   {report.mint_address}",
+        f"Verdict: {verdict}",
+        f"  LP locked/burned : {report.lp_locked_or_burned}  ({report.lp_lock_detail})",
+        f"  Max tax          : {report.tax_pct:.2f}%",
+        f"  Top-10 holders   : {report.top10_holder_pct:.2f}%  "
+        f"(pass={report.holder_concentration_pass})",
+        f"  Funding clustered: {report.funding_source_clustered}",
+        f"  Farmed volume    : {report.farmed_volume_flag}",
+        f"  Volume / mcap    : {report.volume_to_mcap_ratio:.3f}",
+    ]
+    if report.reasons:
+        lines.append("  Reasons:")
+        lines.extend(f"    - {reason}" for reason in report.reasons)
+    return "\n".join(lines)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    """CLI entry point. Read-only: prints a SafetyReport, never trades.
+
+    Exit code 0 if the token passes all checks, 1 otherwise (incl. fail-closed).
+    """
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
+    parser = argparse.ArgumentParser(
+        prog="python -m safety.rug_check",
+        description="Read-only token safety / rug check (RugCheck + Helius).",
+    )
+    parser.add_argument("mint_address", help="SPL token mint address to inspect")
+    parser.add_argument(
+        "--timeout", type=float, default=DEFAULT_TIMEOUT, help="Per-request timeout (s)."
+    )
+    args = parser.parse_args(argv)
+
+    report = asyncio.run(
+        evaluate_token_safety(args.mint_address, timeout=args.timeout)
+    )
+    print(_format_report(report))
+    return 0 if report.passed else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

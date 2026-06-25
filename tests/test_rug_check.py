@@ -18,6 +18,9 @@ from safety.rug_check import evaluate_token_safety
 def safe_payload() -> Dict[str, Any]:
     """A clean token: every check passes."""
     return {
+        "rugged": False,
+        "score_normalised": 10.0,
+        "risk_flags": [],
         "lp_locked_or_burned": True,
         "lp_lock_detail": "LP burned (100%)",
         "buy_tax_pct": 0.0,
@@ -127,6 +130,38 @@ def test_missing_field_marks_only_that_check_failed() -> None:
     # Other checks still evaluated normally.
     assert report.lp_locked_or_burned is True
     assert report.holder_concentration_pass is True
+
+
+def test_rugged_token_fails() -> None:
+    payload = safe_payload()
+    payload["rugged"] = True
+    report = evaluate(payload)
+    assert report.passed is False
+    assert any("RUGGED" in r for r in report.reasons)
+
+
+def test_high_risk_score_fails() -> None:
+    payload = safe_payload()
+    payload["score_normalised"] = 80.0  # > MAX_RISK_SCORE (40)
+    report = evaluate(payload)
+    assert report.passed is False
+    assert any("risk score" in r for r in report.reasons)
+
+
+def test_high_severity_risk_flag_fails() -> None:
+    payload = safe_payload()
+    payload["risk_flags"] = ["Mint authority enabled"]
+    report = evaluate(payload)
+    assert report.passed is False
+    assert any("high-severity risks" in r for r in report.reasons)
+
+
+def test_missing_risk_data_fails_closed() -> None:
+    payload = safe_payload()
+    del payload["score_normalised"]
+    report = evaluate(payload)
+    assert report.passed is False
+    assert any("risk gate failed" in r for r in report.reasons)
 
 
 def test_fail_closed_when_data_source_errors() -> None:
