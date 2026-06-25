@@ -1,6 +1,9 @@
 .env
+.env.*
 *.key
 wallet.json
+*keypair.json
+keypair.json
 __pycache__/
 *.pyc
 venv/
