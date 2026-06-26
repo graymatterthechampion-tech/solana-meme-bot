@@ -19,16 +19,17 @@ import asyncio
 import logging
 import sys
 import time
+from collections import Counter
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import config
-from data.market_feed import SCENARIOS, make_scenario_provider, mock_market_snapshot
+from data.market_feed import mock_market_snapshot
 from safety.rug_check import (
     SafetyReport,
     evaluate_token_safety,
-    mock_safe_token_data,
 )
+from scanner.token_scanner import scan_candidates
 from strategies import hard_exit, profit_taking
 from strategies.entry import (
     EntryAction,
@@ -39,8 +40,15 @@ from strategies.entry import (
 from strategies.hard_exit import ExitDecision, MarketData
 from strategies.profit_taking import Position, SellAction
 
+# Default cap on how many surfaced candidates to evaluate per scan.
+DEFAULT_MAX_CANDIDATES: int = 5
+
 # Async safety gate: mint -> read-only SafetyReport.
 SafetyChecker = Callable[[str], Awaitable[SafetyReport]]
+# Async candidate discovery: () -> list of candidate dicts (mint + stats).
+CandidateScanner = Callable[[], Awaitable[List[Dict[str, Any]]]]
+# Async per-candidate detailed market builder for the entry decision.
+EntryMarketProvider = Callable[[Dict[str, Any]], Awaitable[Optional[EntryMarketData]]]
 
 # Async source that yields a snapshot (or None, fail-closed) for a token.
 SnapshotProvider = Callable[[str, float], Awaitable[Optional[MarketData]]]
@@ -170,6 +178,8 @@ class TradeSession:
     """The full lifecycle outcome for one candidate token.
 
     ``status`` is one of:
+        "no_market_data"  no per-candidate market data could be built (fail-
+                          closed); safety/entry never evaluated
         "rejected_safety" safety gate failed; entry never evaluated
         "no_entry"        safety passed but entry was WAIT/SKIP; no position
         "entered"         safety + BUY; a position was opened and the loop ran
@@ -269,6 +279,136 @@ async def evaluate_and_trade(
     )
 
 
+async def _default_entry_market_provider(
+    candidate: Dict[str, Any],
+) -> Optional[EntryMarketData]:
+    """Build per-candidate :class:`EntryMarketData` from a scanner candidate.
+
+    The scanner surfaces a point-in-time snapshot (price / liquidity / market
+    cap) but NOT the OHLCV history the post-pump dip-buy entry needs. Until real
+    OHLCV is wired (see the ``data.market_feed`` TODO for Dexscreener / Birdeye /
+    Helius), this builds an :class:`EntryMarketData` from only the fields we
+    actually have and leaves the price/volume history EMPTY — so
+    ``evaluate_entry`` fails closed to SKIP rather than guessing on a candidate
+    whose run we cannot verify. Injectable: tests and the real feed supply full
+    history to drive genuine BUY/WAIT/SKIP decisions.
+
+    Returns ``None`` (fail-closed) if the candidate carries no usable price.
+    """
+    try:
+        price = float(candidate.get("price_usd") or 0.0)
+        liquidity = float(candidate.get("liquidity_usd") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if price <= 0:
+        return None
+
+    now = time.time()
+    return EntryMarketData(
+        current_price=price,
+        ath_price=price,
+        ath_timestamp=now,
+        price_history=[],
+        volume_history=[],
+        current_liquidity=liquidity,
+        pre_dip_liquidity=liquidity,
+        market_cap_usd=candidate.get("market_cap_usd"),
+        now=now,
+    )
+
+
+async def scan_and_evaluate(
+    *,
+    max_candidates: int = DEFAULT_MAX_CANDIDATES,
+    max_iterations: int = 5,
+    dry_run: bool = True,
+    scanner: CandidateScanner = scan_candidates,
+    safety_checker: SafetyChecker = _default_safety_checker,
+    entry_market_provider: EntryMarketProvider = _default_entry_market_provider,
+    snapshot_provider: SnapshotProvider = mock_market_snapshot,
+) -> List[TradeSession]:
+    """Discover live candidates and run each through the full pipeline.
+
+    Read-only / dry-run discovery + evaluation; nothing is signed or broadcast.
+    Steps:
+
+        1. ``scanner()`` surfaces the live candidate list (fail-closed to []).
+        2. Process at most ``max_candidates`` of them (a hard cap on per-scan
+           work). Candidates are scanner-sorted by 24h volume (highest first).
+        3. For each, build per-candidate market data; on ``None`` fail closed
+           and record "no_market_data". Otherwise run :func:`evaluate_and_trade`
+           (safety gate -> entry -> managed loop) and record its outcome.
+
+    Logs a per-candidate line showing how far each got and an aggregate summary
+    of the terminal statuses. Returns one :class:`TradeSession` per candidate
+    that was processed (i.e. up to the cap).
+    """
+    cap = max(0, max_candidates)
+    candidates = await scanner()
+    total = len(candidates)
+    if not candidates:
+        logger.info("[scan] no candidates surfaced -> nothing to evaluate")
+        return []
+
+    selected = candidates[:cap]
+    logger.info(
+        "[scan] surfaced %d candidate(s); evaluating %d (cap=%d)",
+        total,
+        len(selected),
+        cap,
+    )
+
+    sessions: List[TradeSession] = []
+    for idx, candidate in enumerate(selected, start=1):
+        mint = str(candidate.get("mint") or "")
+        symbol = str(candidate.get("symbol") or "?")
+        if not mint:
+            logger.warning(
+                "[scan %d/%d] candidate missing mint -> SKIP", idx, len(selected)
+            )
+            continue
+
+        entry_market = await entry_market_provider(candidate)
+        if entry_market is None:
+            logger.warning(
+                "[scan %d/%d] %s (%s) no market data -> SKIP (fail-closed)",
+                idx,
+                len(selected),
+                symbol,
+                mint,
+            )
+            sessions.append(
+                TradeSession(mint_address=mint, status="no_market_data")
+            )
+            continue
+
+        session = await evaluate_and_trade(
+            mint,
+            entry_market,
+            max_iterations=max_iterations,
+            dry_run=dry_run,
+            safety_checker=safety_checker,
+            snapshot_provider=snapshot_provider,
+        )
+        logger.info(
+            "[scan %d/%d] %s (%s) -> %s",
+            idx,
+            len(selected),
+            symbol,
+            mint,
+            session.status,
+        )
+        sessions.append(session)
+
+    summary = Counter(s.status for s in sessions)
+    logger.info(
+        "[scan] done: processed %d candidate(s) -> %s",
+        len(sessions),
+        dict(summary),
+    )
+    return sessions
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments.
 
@@ -297,10 +437,14 @@ def parse_args() -> argparse.Namespace:
         help="Number of loop iterations to run against the mock feed (default: 5).",
     )
     parser.add_argument(
-        "--scenario",
-        choices=SCENARIOS,
-        default="flat",
-        help="Scripted market path to feed the loop (default: flat).",
+        "--max-candidates",
+        dest="max_candidates",
+        type=int,
+        default=DEFAULT_MAX_CANDIDATES,
+        help=(
+            "Max surfaced candidates to evaluate per scan "
+            f"(default: {DEFAULT_MAX_CANDIDATES})."
+        ),
     )
 
     return parser.parse_args()
@@ -358,53 +502,28 @@ def main() -> None:
     if not args.dry_run:
         logger.info("[startup] LIVE mode requested — trading logic not implemented yet.")
 
-    # Demo run against no-network mocks so the WHOLE chain exercises end-to-end:
-    # safety gate -> entry decision -> (on BUY) the managed loop.
-    # TODO: replace the mock safety gather, demo entry market, and scenario
-    # provider with the real data stream (Dexscreener/Birdeye/Helius) once wired.
-    async def demo_safety_checker(mint: str) -> SafetyReport:
-        return await evaluate_token_safety(mint, data_gatherer=mock_safe_token_data)
-
-    demo_entry_price = 0.001
-    entry_liquidity = 100_000.0
-    # A BUY-eligible candidate: proven runner (ATH 5h ago, 10x volume spike),
-    # ~40% pullback, stabilised — so the demo reaches the loop.
-    now = time.time()
-    demo_market = EntryMarketData(
-        current_price=demo_entry_price * 0.60,
-        ath_price=demo_entry_price,
-        ath_timestamp=now - 5 * 3600.0,
-        price_history=[
-            demo_entry_price * m
-            for m in (1.0, 0.9, 0.75, 0.62, 0.61, 0.60, 0.605, 0.60)
-        ],
-        volume_history=[100.0, 100.0, 100.0, 100.0, 1000.0],
-        current_liquidity=entry_liquidity,
-        pre_dip_liquidity=entry_liquidity * 1.1,
-        now=now,
+    # Live, read-only discovery -> per-candidate dry-run evaluation. The scanner
+    # surfaces real Dexscreener candidates; each is run through the full
+    # pipeline (safety gate -> entry decision -> on BUY, the managed loop).
+    # Nothing is ever signed or broadcast.
+    # TODO: swap _default_entry_market_provider for a real OHLCV builder
+    # (Dexscreener/Birdeye/Helius) so genuine BUY/WAIT/SKIP decisions are made;
+    # until then entries fail closed to SKIP for lack of price/volume history.
+    logger.info(
+        "[scan] discovering candidates (read-only); cap=%d", args.max_candidates
     )
-    # The loop manages the opened position along the chosen scenario path.
-    provider = make_scenario_provider(
-        args.scenario,
-        entry_price=demo_entry_price * 0.60,
-        entry_liquidity=entry_liquidity,
-    )
-    logger.info("[startup] scenario=%s", args.scenario)
-    session = asyncio.run(
-        evaluate_and_trade(
-            "DEMO_MINT",
-            demo_market,
+    sessions = asyncio.run(
+        scan_and_evaluate(
+            max_candidates=args.max_candidates,
             max_iterations=args.iterations,
             dry_run=args.dry_run,
-            safety_checker=demo_safety_checker,
-            snapshot_provider=provider,
         )
     )
+    summary = Counter(s.status for s in sessions)
     logger.info(
-        "[shutdown] status=%s ran %d loop iterations (scenario=%s)",
-        session.status,
-        len(session.loop_outcomes),
-        args.scenario,
+        "[shutdown] processed %d candidate(s): %s",
+        len(sessions),
+        dict(summary),
     )
 
 
