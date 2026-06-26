@@ -18,13 +18,17 @@ import argparse
 import asyncio
 import logging
 import sys
-import time
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import config
 from data.market_feed import mock_market_snapshot
+from data.price_history import (
+    OHLCVHistory,
+    build_entry_market_data,
+    get_price_history,
+)
 from safety.rug_check import (
     SafetyReport,
     evaluate_token_safety,
@@ -49,6 +53,8 @@ SafetyChecker = Callable[[str], Awaitable[SafetyReport]]
 CandidateScanner = Callable[[], Awaitable[List[Dict[str, Any]]]]
 # Async per-candidate detailed market builder for the entry decision.
 EntryMarketProvider = Callable[[Dict[str, Any]], Awaitable[Optional[EntryMarketData]]]
+# Async read-only OHLCV source: mint -> recent history (or None, fail-closed).
+HistoryFetcher = Callable[[str], Awaitable[Optional[OHLCVHistory]]]
 
 # Async source that yields a snapshot (or None, fail-closed) for a token.
 SnapshotProvider = Callable[[str, float], Awaitable[Optional[MarketData]]]
@@ -281,19 +287,22 @@ async def evaluate_and_trade(
 
 async def _default_entry_market_provider(
     candidate: Dict[str, Any],
+    *,
+    history_fetcher: HistoryFetcher = get_price_history,
 ) -> Optional[EntryMarketData]:
-    """Build per-candidate :class:`EntryMarketData` from a scanner candidate.
+    """Build per-candidate :class:`EntryMarketData` for the entry decision.
 
     The scanner surfaces a point-in-time snapshot (price / liquidity / market
-    cap) but NOT the OHLCV history the post-pump dip-buy entry needs. Until real
-    OHLCV is wired (see the ``data.market_feed`` TODO for Dexscreener / Birdeye /
-    Helius), this builds an :class:`EntryMarketData` from only the fields we
-    actually have and leaves the price/volume history EMPTY — so
-    ``evaluate_entry`` fails closed to SKIP rather than guessing on a candidate
-    whose run we cannot verify. Injectable: tests and the real feed supply full
-    history to drive genuine BUY/WAIT/SKIP decisions.
+    cap) but NOT the OHLCV history the post-pump dip-buy entry needs. This
+    fetches recent history via the read-only price-data layer
+    (:func:`data.price_history.get_price_history` — Birdeye primary, Dexscreener
+    fallback) and assembles it into the entry inputs. The fetch is fail-closed:
+    on any error / insufficient data it yields no history, and
+    :func:`data.price_history.build_entry_market_data` then produces an
+    EMPTY-history snapshot so ``evaluate_entry`` fails closed to SKIP rather
+    than guessing. ``history_fetcher`` is injectable for tests.
 
-    Returns ``None`` (fail-closed) if the candidate carries no usable price.
+    Returns ``None`` (fail-closed) only if the candidate carries no usable price.
     """
     try:
         price = float(candidate.get("price_usd") or 0.0)
@@ -303,17 +312,13 @@ async def _default_entry_market_provider(
     if price <= 0:
         return None
 
-    now = time.time()
-    return EntryMarketData(
+    mint = str(candidate.get("mint") or "")
+    history = await history_fetcher(mint) if mint else None
+    return build_entry_market_data(
         current_price=price,
-        ath_price=price,
-        ath_timestamp=now,
-        price_history=[],
-        volume_history=[],
         current_liquidity=liquidity,
-        pre_dip_liquidity=liquidity,
         market_cap_usd=candidate.get("market_cap_usd"),
-        now=now,
+        history=history,
     )
 
 

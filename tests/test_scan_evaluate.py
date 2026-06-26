@@ -228,21 +228,35 @@ def test_empty_scan_evaluates_nothing() -> None:
     assert sessions == []
 
 
+async def _no_history(mint: str):
+    """Injected history fetcher that yields nothing (no network, fail-closed)."""
+    return None
+
+
 def test_default_entry_market_provider_fails_closed_without_history() -> None:
-    """The default provider builds data but no history -> entry SKIPs (no_entry)."""
+    """The default provider builds data but no history -> entry SKIPs (no_entry).
+
+    The OHLCV fetch is stubbed to None so the test stays offline; the real
+    Birdeye/Dexscreener path is covered in test_price_history.
+    """
     candidate = make_candidate("REAL")
 
-    market = run(main._default_entry_market_provider(candidate))
+    market = run(
+        main._default_entry_market_provider(candidate, history_fetcher=_no_history)
+    )
     assert market is not None
     assert market.current_price == ENTRY_PRICE * 0.60
     assert market.price_history == [] and market.volume_history == []
 
     # Run it through the full chain: safety passes, entry fails closed to SKIP.
+    async def provider(c):
+        return await main._default_entry_market_provider(c, history_fetcher=_no_history)
+
     sessions = run(
         main.scan_and_evaluate(
             scanner=make_scanner([candidate]),
             safety_checker=safe_checker,
-            # default entry_market_provider (no injection)
+            entry_market_provider=provider,
         )
     )
     assert len(sessions) == 1
