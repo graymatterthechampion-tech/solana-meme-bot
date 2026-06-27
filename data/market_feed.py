@@ -39,6 +39,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 import httpx
 
 import config
+from data.price_history import OHLCVHistory, get_price_history
 from strategies.hard_exit import MarketData
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,17 @@ DEFAULT_TIMEOUT: float = 5.0
 # Placeholder base URL until real providers are wired. Real runs against this
 # will simply fail-closed (return None); tests inject a mock client.
 _PLACEHOLDER_BASE: str = "https://example.invalid/markets"
+
+# --- Live feed (read-only) --------------------------------------------------
+# Liquidity comes from Dexscreener; price + 1m candles + rolling volume come
+# from Birdeye OHLCV (reused via data.price_history).
+DEXSCREENER_TOKENS_URL: str = "https://api.dexscreener.com/latest/dex/tokens"
+LIVE_INTERVAL: str = "1m"          # candle width for the management loop
+LIVE_LOOKBACK_HOURS: float = 2.0   # enough 1m candles to find a 15m volume peak
+ROLLING_WINDOW: int = 15           # candles per rolling window (15 x 1m = 15m)
+
+# Async OHLCV source: mint -> recent history (injectable for tests).
+HistoryFetcher = Callable[..., Awaitable[Optional[OHLCVHistory]]]
 
 # Every field the loop needs. If ANY is absent the snapshot is rejected.
 REQUIRED_RAW_FIELDS: List[str] = [
@@ -146,6 +158,147 @@ async def get_market_snapshot(
         # and non-2xx status (HTTPStatusError). Validation raises Value/Type/Key.
         logger.warning(
             "[feed] fail-closed for %s: %s -> no-action (None)",
+            token_address,
+            exc,
+        )
+        return None
+    finally:
+        if own_client:
+            await client.aclose()
+
+
+async def _fetch_dexscreener_liquidity(
+    client: httpx.AsyncClient, token_address: str, *, timeout: float
+) -> float:
+    """Read-only GET of current pool liquidity (USD) from Dexscreener.
+
+    Picks the Solana pair with the deepest liquidity. Raises ``ValueError`` if
+    no pair carries a usable numeric liquidity (caller fails closed).
+    """
+    url = f"{DEXSCREENER_TOKENS_URL}/{token_address}"
+    resp = await client.get(
+        url, headers={"Accept": "application/json"}, timeout=timeout
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    best_liq = -1.0
+    for pair in data.get("pairs") or []:
+        chain = str(pair.get("chainId", "")).lower()
+        if chain and chain != "solana":
+            continue
+        raw_liq = (pair.get("liquidity") or {}).get("usd")
+        if raw_liq is None:
+            continue
+        liq = float(raw_liq)
+        if liq > best_liq:
+            best_liq = liq
+    if best_liq < 0:
+        raise ValueError("no Solana pair with usable liquidity on Dexscreener")
+    return best_liq
+
+
+def _derive_volume_metrics(
+    history: OHLCVHistory,
+) -> "tuple[float, float, float, float]":
+    """From chronological 1m candles derive the fields the loop's triggers need.
+
+    Returns ``(rolling_volume_15m, peak_volume_15m, candle_1m_open,
+    candle_1m_close)``: the trailing-15m volume sum, the maximum 15m rolling
+    sum seen over the fetched window (the peak the volume-collapse trigger
+    compares against), and the most recent 1m candle's open/close.
+    """
+    vols = history.volume_history
+    n = len(vols)
+    rolling_15m = sum(vols[-ROLLING_WINDOW:])
+
+    if n >= ROLLING_WINDOW:
+        window_sum = sum(vols[:ROLLING_WINDOW])
+        peak = window_sum
+        for i in range(ROLLING_WINDOW, n):
+            window_sum += vols[i] - vols[i - ROLLING_WINDOW]
+            peak = max(peak, window_sum)
+    else:
+        peak = rolling_15m  # not a full window yet -> peak == current
+
+    last = history.candles[-1]
+    return rolling_15m, peak, last.open, last.close
+
+
+async def get_live_market_snapshot(
+    token_address: str,
+    entry_liquidity: float,
+    *,
+    client: Optional[httpx.AsyncClient] = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    birdeye_api_key: Optional[str] = None,
+    history_fetcher: Optional[HistoryFetcher] = None,
+    now: Optional[float] = None,
+) -> Optional[MarketData]:
+    """Assemble a REAL :class:`MarketData` snapshot for the management loop.
+
+    Read-only and fail-closed (matches the ``snapshot_provider`` contract:
+    ``async (token, entry_liquidity) -> Optional[MarketData]``). Sources:
+
+        * Dexscreener — current pool liquidity (USD).
+        * Birdeye 1m OHLCV (via :func:`data.price_history.get_price_history`) —
+          current price (latest close), the latest 1m candle, and the rolling /
+          peak 15m volume derived from the candles.
+
+    Trade-level on-chain signals (``largest_single_sell``, ``top_wallet_sells``)
+    require Helius enhanced-tx history and are NOT sourced here yet; they stay
+    at their benign ``0`` defaults. That is safe by construction: those two
+    fields can only ever ADD a hard-exit trigger, never mask one, so leaving
+    them inactive cannot make an unsafe position look safe.
+
+    Returns ``None`` on any error, missing core data (price/liquidity), or fewer
+    than one full 15m window of 1m candles — the loop treats ``None`` as
+    "no action this iteration".
+    """
+    own_client = client is None
+    if own_client:
+        client = httpx.AsyncClient(timeout=timeout)
+    fetch_history = history_fetcher or get_price_history
+
+    try:
+        liquidity = await _fetch_dexscreener_liquidity(
+            client, token_address, timeout=timeout
+        )
+        history = await fetch_history(
+            token_address,
+            interval=LIVE_INTERVAL,
+            lookback_hours=LIVE_LOOKBACK_HOURS,
+            min_candles=ROLLING_WINDOW,
+            client=client,
+            timeout=timeout,
+            birdeye_api_key=birdeye_api_key,
+            now=now,
+        )
+        # Need real 1m candles: the coarse Dexscreener fallback can't yield a
+        # 1m candle or a true 15m volume, so anything but Birdeye fails closed.
+        if (history is None or history.source != "birdeye"
+                or len(history) < ROLLING_WINDOW):
+            logger.warning(
+                "[feed] %s no usable 1m candle history -> fail-closed (None)",
+                token_address,
+            )
+            return None
+
+        rolling_15m, peak_15m, c_open, c_close = _derive_volume_metrics(history)
+        raw: Dict[str, Any] = {
+            "price": history.current_price,   # latest 1m close (Birdeye)
+            "volume_15m": rolling_15m,
+            "peak_volume_15m": peak_15m,
+            "liquidity": liquidity,           # Dexscreener
+            "largest_single_sell": 0.0,       # Helius-only signal; inactive
+            "top_wallet_sells": 0,            # Helius-only signal; inactive
+            "candle_1m_open": c_open,
+            "candle_1m_close": c_close,
+        }
+        return _build_snapshot(raw, entry_liquidity)
+    except (httpx.HTTPError, KeyError, ValueError, TypeError) as exc:
+        logger.warning(
+            "[feed] live fail-closed for %s: %s -> no-action (None)",
             token_address,
             exc,
         )

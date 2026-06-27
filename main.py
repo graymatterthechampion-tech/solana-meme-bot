@@ -23,12 +23,13 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import config
-from data.market_feed import mock_market_snapshot
+from data.market_feed import get_live_market_snapshot, mock_market_snapshot
 from data.price_history import (
     OHLCVHistory,
     build_entry_market_data,
     get_price_history,
 )
+from execution.fill_simulator import FillResult, simulate_fill
 from safety.rug_check import (
     SafetyReport,
     evaluate_token_safety,
@@ -75,6 +76,45 @@ class LoopOutcome:
     path: str
     exit_decision: Optional[ExitDecision] = None
     sell_actions: List[SellAction] = field(default_factory=list)
+    fills: List[FillResult] = field(default_factory=list)
+
+
+def _simulate_sell(
+    position: Position, tokens: float, market_data: MarketData, label: str
+) -> FillResult:
+    """Model the realistic outcome of one dry-run sell and log net proceeds/PnL.
+
+    Uses the live snapshot's price and pool liquidity so the simulated fill
+    reflects real price impact + fees + fill-delay drift (see
+    :mod:`execution.fill_simulator`). Realised PnL is net proceeds minus the
+    cost basis (tokens * entry price). Nothing is signed or broadcast.
+    """
+    fill = simulate_fill(
+        tokens, market_data.current_price, market_data.current_liquidity
+    )
+    pnl = fill.net_proceeds_usd - tokens * position.entry_price
+    logger.info(
+        "[fill] %s tokens=%.6f @ %.8f notional=$%.2f slippage=%.2f%%%s "
+        "net=$%.2f pnl=$%.2f",
+        label, tokens, market_data.current_price, fill.notional_usd,
+        fill.total_slippage_pct * 100,
+        " OVER-CAP" if fill.exceeded_slippage_cap else "",
+        fill.net_proceeds_usd, pnl,
+    )
+    return fill
+
+
+def realised_pnl_usd(
+    outcomes: List[Optional[LoopOutcome]], entry_price: float
+) -> float:
+    """Sum simulated realised PnL (net proceeds - cost basis) across all fills."""
+    total = 0.0
+    for outcome in outcomes:
+        if outcome is None:
+            continue
+        for fill in outcome.fills:
+            total += fill.net_proceeds_usd - fill.requested_tokens * entry_price
+    return total
 
 
 async def process_position(
@@ -86,7 +126,8 @@ async def process_position(
 
     Hard-exit checks run first. If ``should_exit`` is True the full exit is
     executed (dry-run logged inside ``evaluate_hard_exit``) and profit-taking
-    is skipped entirely for this position. Otherwise profit-taking runs.
+    is skipped entirely for this position. Otherwise profit-taking runs. Each
+    sell is run through the fill simulator so dry-run PnL reflects real friction.
 
     Calls ``profit_taking.evaluate_take_profit`` via the module attribute (not
     a bound import) so the ordering guarantee stays observable/testable.
@@ -103,7 +144,13 @@ async def process_position(
             exit_decision.reason,
             exit_decision.tokens_to_sell,
         )
-        return LoopOutcome(path="hard_exit", exit_decision=exit_decision)
+        fill = _simulate_sell(
+            position, exit_decision.tokens_to_sell, market_data,
+            f"HARD_EXIT/{exit_decision.trigger}",
+        )
+        return LoopOutcome(
+            path="hard_exit", exit_decision=exit_decision, fills=[fill]
+        )
 
     # --- 2. Profit-taking only if no hard exit fired ------------------------
     sell_actions = await profit_taking.evaluate_take_profit(
@@ -115,7 +162,13 @@ async def process_position(
             [a.tier for a in sell_actions],
             position.remaining,
         )
-        return LoopOutcome(path="profit_taking", sell_actions=sell_actions)
+        fills = [
+            _simulate_sell(position, a.tokens_to_sell, market_data, f"PROFIT/{a.tier}")
+            for a in sell_actions
+        ]
+        return LoopOutcome(
+            path="profit_taking", sell_actions=sell_actions, fills=fills
+        )
 
     logger.info(
         "[loop] path=HOLD no hard exit, no profit tier (price=%.8f remaining=%.6f)",
@@ -274,6 +327,12 @@ async def evaluate_and_trade(
         max_iterations=max_iterations,
         dry_run=dry_run,
         snapshot_provider=snapshot_provider,
+    )
+    pnl = realised_pnl_usd(outcomes, position.entry_price)
+    n_fills = sum(len(o.fills) for o in outcomes if o is not None)
+    logger.info(
+        "[trade] %s managed -> simulated realised PnL = $%.2f over %d fill(s)",
+        mint_address, pnl, n_fills,
     )
     return TradeSession(
         mint_address=mint_address,
@@ -508,12 +567,10 @@ def main() -> None:
         logger.info("[startup] LIVE mode requested — trading logic not implemented yet.")
 
     # Live, read-only discovery -> per-candidate dry-run evaluation. The scanner
-    # surfaces real Dexscreener candidates; each is run through the full
-    # pipeline (safety gate -> entry decision -> on BUY, the managed loop).
-    # Nothing is ever signed or broadcast.
-    # TODO: swap _default_entry_market_provider for a real OHLCV builder
-    # (Dexscreener/Birdeye/Helius) so genuine BUY/WAIT/SKIP decisions are made;
-    # until then entries fail closed to SKIP for lack of price/volume history.
+    # surfaces real Dexscreener candidates; each runs through the full pipeline
+    # (safety gate -> real-OHLCV entry decision -> on BUY, the managed loop on
+    # the live market feed, with simulated-friction fills). Nothing is ever
+    # signed or broadcast.
     logger.info(
         "[scan] discovering candidates (read-only); cap=%d", args.max_candidates
     )
@@ -522,6 +579,7 @@ def main() -> None:
             max_candidates=args.max_candidates,
             max_iterations=args.iterations,
             dry_run=args.dry_run,
+            snapshot_provider=get_live_market_snapshot,
         )
     )
     summary = Counter(s.status for s in sessions)
