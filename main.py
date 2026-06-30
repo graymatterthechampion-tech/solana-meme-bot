@@ -48,6 +48,9 @@ from strategies.profit_taking import Position, SellAction
 # Default cap on how many surfaced candidates to evaluate per scan.
 DEFAULT_MAX_CANDIDATES: int = 5
 
+# Default seconds to sleep between cycles in continuous (--loop) mode.
+DEFAULT_INTERVAL_SECONDS: float = 60.0
+
 # Async safety gate: mint -> read-only SafetyReport.
 SafetyChecker = Callable[[str], Awaitable[SafetyReport]]
 # Async candidate discovery: () -> list of candidate dicts (mint + stats).
@@ -59,6 +62,12 @@ HistoryFetcher = Callable[[str], Awaitable[Optional[OHLCVHistory]]]
 
 # Async source that yields a snapshot (or None, fail-closed) for a token.
 SnapshotProvider = Callable[[str, float], Awaitable[Optional[MarketData]]]
+
+# Async one-cycle scan+evaluate (defaults to scan_and_evaluate); injectable in
+# tests. Accepts the scan_and_evaluate keyword arguments and returns its sessions.
+ContinuousScan = Callable[..., Awaitable[List["TradeSession"]]]
+# Async sleep between cycles (defaults to asyncio.sleep); injectable in tests.
+AsyncSleep = Callable[[float], Awaitable[None]]
 
 logger = logging.getLogger(__name__)
 
@@ -473,6 +482,130 @@ async def scan_and_evaluate(
     return sessions
 
 
+def session_pnl(session: TradeSession) -> float:
+    """Simulated realised PnL (USD) for one candidate's managed loop.
+
+    Zero unless a position was actually opened (``status == "entered"``); for
+    every other terminal status no fills occurred, so there is nothing to sum.
+    """
+    if session.position is None:
+        return 0.0
+    return realised_pnl_usd(session.loop_outcomes, session.position.entry_price)
+
+
+@dataclass
+class CumulativeStats:
+    """Running totals across every cycle of a continuous (--loop) run.
+
+    Accumulated in place so the totals survive even if the run is interrupted
+    mid-cycle (the caller keeps a reference and reports it on shutdown):
+
+        cycles          completed scan/evaluate cycles
+        total_candidates candidates processed across all cycles
+        status_counts   per-terminal-status tallies (entered, no_entry, ...)
+        total_pnl_usd   summed simulated realised PnL across all cycles
+    """
+
+    cycles: int = 0
+    total_candidates: int = 0
+    status_counts: Counter = field(default_factory=Counter)
+    total_pnl_usd: float = 0.0
+
+    def record_cycle(self, sessions: List[TradeSession]) -> None:
+        """Fold one cycle's sessions into the running totals."""
+        self.cycles += 1
+        self.total_candidates += len(sessions)
+        self.status_counts.update(s.status for s in sessions)
+        self.total_pnl_usd += sum(session_pnl(s) for s in sessions)
+
+
+def _log_cumulative_summary(stats: CumulativeStats) -> None:
+    """Log the cumulative summary for a finished/interrupted continuous run."""
+    logger.info(
+        "[shutdown] continuous run: %d cycle(s), %d candidate(s) scanned, "
+        "statuses=%s, total simulated PnL=$%.2f",
+        stats.cycles,
+        stats.total_candidates,
+        dict(stats.status_counts),
+        stats.total_pnl_usd,
+    )
+
+
+async def run_continuous(
+    *,
+    interval: float = DEFAULT_INTERVAL_SECONDS,
+    max_candidates: int = DEFAULT_MAX_CANDIDATES,
+    max_iterations: int = 5,
+    dry_run: bool = True,
+    scan: ContinuousScan = scan_and_evaluate,
+    snapshot_provider: SnapshotProvider = mock_market_snapshot,
+    sleep: AsyncSleep = asyncio.sleep,
+    max_cycles: Optional[int] = None,
+    stats: Optional[CumulativeStats] = None,
+) -> CumulativeStats:
+    """Re-run ``scan_and_evaluate`` every ``interval`` seconds until interrupted.
+
+    Read-only / dry-run, exactly like the single pass — nothing is signed or
+    broadcast. Each cycle runs the full discovery->evaluate pipeline and folds
+    its sessions into ``stats``. Between cycles the loop sleeps ``interval``
+    seconds (skipped after the final cycle).
+
+    Stopping:
+        * In production ``max_cycles`` is ``None`` (run forever); the loop ends
+          when the user sends Ctrl+C. The resulting ``KeyboardInterrupt`` (or
+          the ``CancelledError`` asyncio raises into the task on shutdown) is
+          caught here and the loop stops cleanly with totals intact.
+        * ``max_cycles`` bounds the loop for tests/automation: it runs exactly
+          that many cycles then returns.
+
+    ``stats`` is accumulated IN PLACE; pass one in so a caller still holds the
+    running totals if the loop is interrupted. ``scan`` and ``sleep`` are
+    injectable so tests can drive cycles without network or real delays.
+    """
+    if stats is None:
+        stats = CumulativeStats()
+
+    cycle = 0
+    try:
+        while max_cycles is None or cycle < max_cycles:
+            cycle += 1
+            logger.info(
+                "[loop] === cycle %d start (dry_run=%s, interval=%.0fs) ===",
+                cycle,
+                dry_run,
+                interval,
+            )
+            sessions = await scan(
+                max_candidates=max_candidates,
+                max_iterations=max_iterations,
+                dry_run=dry_run,
+                snapshot_provider=snapshot_provider,
+            )
+            stats.record_cycle(sessions)
+            logger.info(
+                "[loop] cycle %d done: %d candidate(s) %s | "
+                "cumulative PnL=$%.2f over %d cycle(s)",
+                cycle,
+                len(sessions),
+                dict(Counter(s.status for s in sessions)),
+                stats.total_pnl_usd,
+                stats.cycles,
+            )
+
+            # Don't sleep after the final bounded cycle.
+            if max_cycles is not None and cycle >= max_cycles:
+                break
+            if interval > 0:
+                await sleep(interval)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        logger.info(
+            "[loop] interrupted after %d completed cycle(s) — stopping cleanly",
+            stats.cycles,
+        )
+
+    return stats
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments.
 
@@ -508,6 +641,26 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Max surfaced candidates to evaluate per scan "
             f"(default: {DEFAULT_MAX_CANDIDATES})."
+        ),
+    )
+    parser.add_argument(
+        "--loop",
+        dest="loop",
+        action="store_true",
+        default=False,
+        help=(
+            "Run continuously, re-scanning every --interval seconds until "
+            "interrupted with Ctrl+C (default: single pass)."
+        ),
+    )
+    parser.add_argument(
+        "--interval",
+        dest="interval",
+        type=float,
+        default=DEFAULT_INTERVAL_SECONDS,
+        help=(
+            "Seconds to sleep between cycles in --loop mode "
+            f"(default: {DEFAULT_INTERVAL_SECONDS:.0f})."
         ),
     )
 
@@ -566,11 +719,38 @@ def main() -> None:
     if not args.dry_run:
         logger.info("[startup] LIVE mode requested — trading logic not implemented yet.")
 
-    # Live, read-only discovery -> per-candidate dry-run evaluation. The scanner
-    # surfaces real Dexscreener candidates; each runs through the full pipeline
-    # (safety gate -> real-OHLCV entry decision -> on BUY, the managed loop on
-    # the live market feed, with simulated-friction fills). Nothing is ever
-    # signed or broadcast.
+    # Continuous mode: keep re-scanning every --interval seconds until Ctrl+C.
+    # Stats are accumulated in a local object so the cumulative summary is still
+    # reported if the run is interrupted mid-cycle. Read-only/dry-run throughout.
+    if args.loop:
+        logger.info(
+            "[startup] continuous mode — re-scanning every %.0fs (Ctrl+C to stop)",
+            args.interval,
+        )
+        stats = CumulativeStats()
+        try:
+            asyncio.run(
+                run_continuous(
+                    interval=args.interval,
+                    max_candidates=args.max_candidates,
+                    max_iterations=args.iterations,
+                    dry_run=args.dry_run,
+                    snapshot_provider=get_live_market_snapshot,
+                    stats=stats,
+                )
+            )
+        except KeyboardInterrupt:
+            # Ctrl+C can surface here (out of asyncio.run) rather than inside the
+            # coroutine; either way the in-place stats are intact.
+            logger.info("[loop] keyboard interrupt received — shutting down")
+        _log_cumulative_summary(stats)
+        return
+
+    # Single pass: live, read-only discovery -> per-candidate dry-run evaluation.
+    # The scanner surfaces real Dexscreener candidates; each runs through the
+    # full pipeline (safety gate -> real-OHLCV entry decision -> on BUY, the
+    # managed loop on the live market feed, with simulated-friction fills).
+    # Nothing is ever signed or broadcast.
     logger.info(
         "[scan] discovering candidates (read-only); cap=%d", args.max_candidates
     )
