@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional
 import httpx
 import pytest
 
+import config
 from data.market_feed import ROLLING_WINDOW, get_live_market_snapshot
 from safety import rug_check
 
@@ -122,9 +123,12 @@ def test_insufficient_candles_fails_closed() -> None:
     assert snap is None
 
 
-def test_no_birdeye_key_fails_closed() -> None:
+def test_no_birdeye_key_fails_closed(monkeypatch) -> None:
     # Without a Birdeye key there are no real 1m candles; liquidity alone is
-    # not a tradeable snapshot, so the feed fails closed.
+    # not a tradeable snapshot, so the feed fails closed. Null out the configured
+    # key so a real key in a developer's local .env can't leak in (api_key=None
+    # otherwise resolves to config.BIRDEYE_API_KEY).
+    monkeypatch.setattr(config, "BIRDEYE_API_KEY", None)
     items = [candle((18 - i) * 60.0, close=1.0, vol=5.0) for i in range(18)]
     snap = fetch(make_handler(birdeye_json=birdeye_payload(items)), api_key=None)
     assert snap is None

@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Optional
 import httpx
 import pytest
 
+import config
 from data.price_history import (
     build_entry_market_data,
     get_price_history,
@@ -223,8 +224,14 @@ def test_insufficient_birdeye_candles_falls_back() -> None:
     assert handler.state["dex_calls"] == 1
 
 
-def test_no_api_key_skips_birdeye_uses_dexscreener() -> None:
-    """No Birdeye key -> Birdeye never called, Dexscreener fallback used."""
+def test_no_api_key_skips_birdeye_uses_dexscreener(monkeypatch) -> None:
+    """No Birdeye key -> Birdeye never called, Dexscreener fallback used.
+
+    Null out the configured key so the test is hermetic: ``birdeye_api_key=None``
+    resolves to ``config.BIRDEYE_API_KEY``, so a real key in a developer's local
+    ``.env`` must not leak in and make Birdeye fire.
+    """
+    monkeypatch.setattr(config, "BIRDEYE_API_KEY", None)
     handler = make_handler(dex_json=dexscreener_payload())
     history = fetch(handler, api_key=None)
 
