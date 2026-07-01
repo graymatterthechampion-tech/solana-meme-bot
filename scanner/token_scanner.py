@@ -14,18 +14,27 @@ trading history — NOT brand-new launches. It pre-filters on a market-cap band,
 minimum liquidity, minimum 24h volume, and a minimum pair age before surfacing
 anything, so brand-new / illiquid pairs never reach the pipeline.
 
+To keep rug-like tokens out of the pipeline the defaults are deliberately
+strict: only established AMMs (Raydium / Orca / Meteora) are trusted, un-graduated
+Pump.fun bonding-curve pairs are rejected outright, and any pair carrying a
+freeze-authority flag or an explicitly-unlocked (0%) LP is dropped when that
+signal is cheaply present in the pair data. Every threshold is a keyword
+argument so callers can loosen or tighten the gate without editing this module.
+
 FAIL-CLOSED CONTRACT
 --------------------
 On ANY API error, timeout, rate-limit, or missing/invalid field the scanner
 skips that candidate, and on a total fetch failure it returns an EMPTY list. It
 never surfaces unvalidated or partial data: a candidate is emitted only when
-every required field is present and valid.
+every required field is present and valid. Security signals (freeze authority,
+LP lock) are best-effort enrichment: absent = "unknown" and non-disqualifying;
+only an explicitly-bad value excludes the candidate.
 
 DATA SOURCE (read-only, no API key)
 -----------------------------------
 Dexscreener public search endpoint via httpx GET. Results are filtered to
-Solana pairs on established DEXs (Raydium, Orca, ...), de-duplicated by mint,
-and sorted by 24h volume.
+Solana pairs on established DEXs (Raydium, Orca, Meteora), de-duplicated by
+mint, and sorted by 24h volume.
 """
 
 from __future__ import annotations
@@ -49,21 +58,89 @@ DEFAULT_TIMEOUT: float = 8.0
 # are always re-filtered to Solana + allowed DEXs in code.
 DEFAULT_QUERIES: tuple = ("SOL/USDC", "SOL")
 
-# Established Solana DEXs we trust for a "proven runner". Brand-new/obscure
-# venues are excluded. Tunable via the ``allowed_dexes`` parameter.
-ALLOWED_DEXES: frozenset = frozenset(
-    {"raydium", "orca", "meteora", "lifinity", "phoenix", "fluxbeam", "openbook"}
-)
+# Established Solana AMMs we trust for a "proven runner". Deliberately narrow:
+# only venues that require a real, deployed liquidity pool. Brand-new/obscure or
+# bonding-curve venues are excluded. Tunable via the ``allowed_dexes`` parameter.
+ALLOWED_DEXES: frozenset = frozenset({"raydium", "orca", "meteora"})
+
+# Bonding-curve / pre-graduation launchpads. A token trading on one of these has
+# NOT migrated to a real AMM pool yet (e.g. an un-graduated Pump.fun launch), so
+# it is rejected regardless of ``allowed_dexes``. A GRADUATED Pump.fun token
+# trades on Raydium (dexId "raydium"), so it is judged on its pool like any
+# other established pair — only the bonding-curve stage is excluded here.
+UNGRADUATED_VENUES: frozenset = frozenset({"pumpfun", "pump", "moonshot"})
 
 # --- Pre-filter thresholds (tunable) ----------------------------------------
+# Defaults are intentionally strict to keep rug-like tokens out of the pipeline.
 MIN_MARKET_CAP_USD: float = 50_000.0
 MAX_MARKET_CAP_USD: float = 50_000_000.0
-MIN_LIQUIDITY_USD: float = 10_000.0
-MIN_VOLUME_24H_USD: float = 50_000.0
-MIN_AGE_HOURS: float = 1.0   # exclude pairs too new to have a proven run
+MIN_LIQUIDITY_USD: float = 30_000.0   # deep enough to exit without wrecking price
+MIN_VOLUME_24H_USD: float = 100_000.0  # real, sustained trading interest
+MIN_AGE_HOURS: float = 6.0   # old enough to have a real, provable trading history
 
 # Async read-only source of raw Dexscreener pair dicts (injectable for tests).
 PairFetcher = Callable[[], Awaitable[List[Dict[str, Any]]]]
+
+# --- Security-signal field conventions --------------------------------------
+# Dexscreener's public search rarely carries these, but enriched responses and
+# some proxies do. We read them opportunistically and only act on an explicitly
+# bad value; a missing signal is treated as "unknown", never as a pass/fail.
+_FREEZE_BOOL_KEYS: tuple = ("isFreezable", "freezable", "hasFreezeAuthority", "freezeAuthorityEnabled")
+_FREEZE_ADDR_KEYS: tuple = ("freezeAuthority",)
+_LOCK_PCT_KEYS: tuple = (
+    "lockedLiquidityPct", "lpLockedPct", "lockedPct", "liquidityLockedPct", "lockedLpPct",
+)
+# Address values that mean "no authority set" (freeze authority revoked/absent).
+_NULL_AUTHORITIES: frozenset = frozenset(
+    {"", "none", "null", "0", "false", "11111111111111111111111111111111"}
+)
+
+
+def _security_sources(pair: Dict[str, Any]):
+    """Yield the sub-dicts of a raw pair that may carry security signals."""
+    yield pair
+    for key in ("baseToken", "info", "security", "audit", "liquidity"):
+        sub = pair.get(key)
+        if isinstance(sub, dict):
+            yield sub
+
+
+def _extract_security(pair: Dict[str, Any]) -> tuple[Optional[bool], Optional[float]]:
+    """Best-effort read of (freeze_authority, locked_lp_pct) from a raw pair.
+
+    Returns ``None`` for either signal when it is not cheaply present. Never
+    raises: any malformed value is treated as "unknown" for that signal so the
+    optional enrichment can't break the read-only scan.
+    """
+    freeze: Optional[bool] = None
+    locked_lp_pct: Optional[float] = None
+
+    for src in _security_sources(pair):
+        if freeze is None:
+            for key in _FREEZE_BOOL_KEYS:
+                val = src.get(key)
+                if val is not None:
+                    freeze = bool(val)  # True => freezable/authority present => risky
+                    break
+        if freeze is None:
+            for key in _FREEZE_ADDR_KEYS:
+                val = src.get(key)
+                if val is not None:
+                    # A real address => authority present (risky); a null/system
+                    # address => authority revoked (safe).
+                    freeze = str(val).strip().lower() not in _NULL_AUTHORITIES
+                    break
+        if locked_lp_pct is None:
+            for key in _LOCK_PCT_KEYS:
+                val = src.get(key)
+                if val is not None:
+                    try:
+                        locked_lp_pct = float(val)
+                    except (TypeError, ValueError):
+                        locked_lp_pct = None
+                    break
+
+    return freeze, locked_lp_pct
 
 
 def _parse_pair(pair: Dict[str, Any], now: float) -> Optional[Dict[str, Any]]:
@@ -111,6 +188,9 @@ def _parse_pair(pair: Dict[str, Any], now: float) -> Optional[Dict[str, Any]]:
         price_raw = pair.get("priceUsd")
         price_usd = float(price_raw) if price_raw is not None else 0.0
 
+        # Optional security enrichment: None when not cheaply present.
+        freeze_authority, locked_lp_pct = _extract_security(pair)
+
         return {
             "mint": str(mint),
             "symbol": str(base.get("symbol") or "?"),
@@ -121,6 +201,10 @@ def _parse_pair(pair: Dict[str, Any], now: float) -> Optional[Dict[str, Any]]:
             "age_hours": age_hours,
             "price_usd": price_usd,
             "pair_address": str(pair.get("pairAddress") or ""),
+            # True => freeze authority present (risky); None => unknown.
+            "freeze_authority": freeze_authority,
+            # 0.0 => LP explicitly unlocked (risky); None => unknown.
+            "locked_lp_pct": locked_lp_pct,
         }
     except (TypeError, ValueError):
         # Missing/null/non-numeric field -> fail closed for this candidate.
@@ -136,8 +220,15 @@ def _passes_filters(
     min_liquidity_usd: float,
     min_volume_24h_usd: float,
     min_age_hours: float,
+    exclude_freeze_authority: bool,
+    exclude_unlocked_lp: bool,
 ) -> bool:
     """Return True only if the candidate clears every pre-filter."""
+    # Bonding-curve / un-graduated launchpad -> never a proven runner. Checked
+    # first, and independently of ``allowed_dexes``, so widening the allow-list
+    # can never let an un-graduated Pump.fun pair through.
+    if candidate["source_dex"] in UNGRADUATED_VENUES:
+        return False
     if candidate["source_dex"] not in allowed_dexes:
         return False
     if not (min_market_cap_usd <= candidate["market_cap_usd"] <= max_market_cap_usd):
@@ -147,6 +238,12 @@ def _passes_filters(
     if candidate["volume_24h_usd"] < min_volume_24h_usd:
         return False
     if candidate["age_hours"] < min_age_hours:
+        return False
+    # Optional security gates: only reject on an explicitly-bad signal; an
+    # unknown (None) signal is not disqualifying.
+    if exclude_freeze_authority and candidate.get("freeze_authority") is True:
+        return False
+    if exclude_unlocked_lp and candidate.get("locked_lp_pct") == 0.0:
         return False
     return True
 
@@ -185,6 +282,8 @@ async def scan_candidates(
     min_liquidity_usd: float = MIN_LIQUIDITY_USD,
     min_volume_24h_usd: float = MIN_VOLUME_24H_USD,
     min_age_hours: float = MIN_AGE_HOURS,
+    exclude_freeze_authority: bool = True,
+    exclude_unlocked_lp: bool = True,
     now: Optional[float] = None,
 ) -> List[Dict[str, Any]]:
     """Discover and surface candidate tokens, sorted by 24h volume (desc).
@@ -229,6 +328,8 @@ async def scan_candidates(
             min_liquidity_usd=min_liquidity_usd,
             min_volume_24h_usd=min_volume_24h_usd,
             min_age_hours=min_age_hours,
+            exclude_freeze_authority=exclude_freeze_authority,
+            exclude_unlocked_lp=exclude_unlocked_lp,
         ):
             continue
         candidates.append(parsed)
@@ -259,10 +360,12 @@ def _format_candidates(candidates: List[Dict[str, Any]]) -> str:
         return "No candidates surfaced."
     lines = [f"Surfaced {len(candidates)} candidate(s):"]
     for c in candidates:
+        lock = c.get("locked_lp_pct")
+        lock_str = "lp=?" if lock is None else f"lp={lock:.0f}%"
         lines.append(
             f"  {c['symbol']:<8} {c['mint']}  dex={c['source_dex']:<9} "
             f"mcap=${c['market_cap_usd']:,.0f}  liq=${c['liquidity_usd']:,.0f}  "
-            f"vol24h=${c['volume_24h_usd']:,.0f}  age={c['age_hours']:.1f}h"
+            f"vol24h=${c['volume_24h_usd']:,.0f}  age={c['age_hours']:.1f}h  {lock_str}"
         )
     return "\n".join(lines)
 
@@ -277,9 +380,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--timeout", type=float, default=DEFAULT_TIMEOUT, help="Per-request timeout (s)."
     )
+    parser.add_argument(
+        "--min-liquidity", type=float, default=MIN_LIQUIDITY_USD,
+        help="Minimum pool liquidity in USD (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--min-volume", type=float, default=MIN_VOLUME_24H_USD,
+        help="Minimum 24h volume in USD (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--min-age-hours", type=float, default=MIN_AGE_HOURS,
+        help="Minimum pair age in hours (default: %(default)s).",
+    )
     args = parser.parse_args(argv)
 
-    candidates = asyncio.run(scan_candidates(timeout=args.timeout))
+    candidates = asyncio.run(
+        scan_candidates(
+            timeout=args.timeout,
+            min_liquidity_usd=args.min_liquidity,
+            min_volume_24h_usd=args.min_volume,
+            min_age_hours=args.min_age_hours,
+        )
+    )
     print(_format_candidates(candidates))
     return 0
 
