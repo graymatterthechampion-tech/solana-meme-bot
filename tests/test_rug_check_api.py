@@ -285,13 +285,13 @@ def test_amm_pool_excluded_from_concentration() -> None:
 
 
 def test_real_whale_concentration_fails() -> None:
-    # A non-pool whale at 20% must fail concentration.
-    holders = [{"owner": "Whale", "pct": 20.0}, {"owner": "H1", "pct": 1.0}]
+    # A non-pool whale at 92% (>= 30% threshold) must fail concentration.
+    holders = [{"owner": "Whale", "pct": 92.0}, {"owner": "H1", "pct": 1.0}]
     report = evaluate(
         make_handler(rug_json=rugcheck_report(top_holders=holders, known_accounts={}))
     )
     assert report.passed is False
-    assert report.top10_holder_pct == pytest.approx(21.0)
+    assert report.top10_holder_pct == pytest.approx(93.0)
     assert report.holder_concentration_pass is False
 
 

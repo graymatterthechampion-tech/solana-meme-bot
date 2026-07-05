@@ -45,7 +45,11 @@ logger = logging.getLogger(__name__)
 
 # --- Thresholds (tunable) ---------------------------------------------------
 MAX_TAX_PCT: float = 1.0          # fail if buy/sell tax >= 1%
-MAX_TOP10_PCT: float = 15.0       # fail if top-10 holders own >= 15%
+# Fail the holder-concentration check when the top-10 non-pool holders own at
+# least this FRACTION of supply. Deliberately calibrated to 0.30 (30%) for the
+# Solana meme-coin market, where moderate holder concentration is normal — tune
+# as needed. Only this bar is relaxed; every other safety check stays strict.
+MAX_TOP10_HOLDER_PCT: float = 0.30  # fraction of supply (0.30 = 30%)
 FARMED_VOL_RATIO: float = 1.0     # 24h volume >= market cap is suspicious...
 FARMED_FLAT_PRICE_PCT: float = 5.0  # ...when 24h price moved <= 5% (flat)
 LP_LOCK_MIN_PCT: float = 95.0     # treat LP as locked/burned at >= 95%
@@ -196,11 +200,14 @@ def _evaluate(mint_address: str, raw: Dict[str, Any]) -> SafetyReport:
     # 3 & 4. Holder concentration + funding clustering (share the holder data).
     try:
         top10 = _top_holders(list(_require(raw, "holders")))
+        # ``top10_holder_pct`` is a PERCENT (sum of per-holder pct); the tunable
+        # threshold is a fraction of supply, so compare against it * 100.
+        max_top10_pct = MAX_TOP10_HOLDER_PCT * 100.0
         top10_holder_pct = sum(float(h["pct"]) for h in top10)
-        holder_concentration_pass = top10_holder_pct < MAX_TOP10_PCT
+        holder_concentration_pass = top10_holder_pct < max_top10_pct
         if not holder_concentration_pass:
             reasons.append(
-                f"top-10 holders own {top10_holder_pct:.2f}% (>= {MAX_TOP10_PCT:.0f}%)"
+                f"top-10 holders own {top10_holder_pct:.2f}% (>= {max_top10_pct:.0f}%)"
             )
 
         funders: Dict[str, List[str]] = {}

@@ -83,22 +83,38 @@ def test_high_tax_fails() -> None:
     assert any("tax too high" in r for r in report.reasons)
 
 
+def test_moderate_holder_concentration_passes() -> None:
+    """Moderate concentration (25% < 30% threshold) passes the holder check.
+
+    Calibration for the Solana meme-coin market: a token whose top-10 own 25%
+    is no longer rejected on concentration alone.
+    """
+    payload = safe_payload()
+    # Five distinct whales at 5% each = 25% (< 30%), distinct funders.
+    payload["holders"] = [
+        {"address": f"W{i}", "pct": 5.0, "funded_by": f"src{i}"} for i in range(5)
+    ]
+    report = evaluate(payload)
+    assert report.holder_concentration_pass is True
+    assert report.top10_holder_pct == pytest.approx(25.0)
+    assert report.passed is True  # every other check is clean
+
+
 def test_holder_concentration_fails() -> None:
     payload = safe_payload()
-    # Seven distinct whales at 3% each = 21% (>= 15%), distinct funders.
-    payload["holders"] = [
-        {"address": f"W{i}", "pct": 3.0, "funded_by": f"src{i}"} for i in range(7)
-    ]
+    # A whale owning 92% (>= 30%) still fails the concentration check.
+    payload["holders"] = [{"address": "Whale", "pct": 92.0, "funded_by": "src0"}]
     report = evaluate(payload)
     assert report.passed is False
     assert report.holder_concentration_pass is False
-    assert report.top10_holder_pct == pytest.approx(21.0)
-    assert report.funding_source_clustered is False  # distinct funders
+    assert report.top10_holder_pct == pytest.approx(92.0)
+    assert report.funding_source_clustered is False  # single funder
+    assert any("top-10 holders own" in r for r in report.reasons)
 
 
 def test_funding_clustering_fails() -> None:
     payload = safe_payload()
-    # Low concentration (10% < 15%) but all funded from one wallet.
+    # Low concentration (10% < 30%) but all funded from one wallet.
     payload["holders"] = [
         {"address": f"W{i}", "pct": 2.0, "funded_by": "sameWallet"} for i in range(5)
     ]
