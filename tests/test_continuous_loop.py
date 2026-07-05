@@ -64,7 +64,9 @@ def test_bounded_loop_runs_n_cycles_then_stops() -> None:
         "max_candidates",
         "max_iterations",
         "dry_run",
+        "strategy",
         "snapshot_provider",
+        "meta_boost_provider",
     }
     assert calls[0]["dry_run"] is True
 

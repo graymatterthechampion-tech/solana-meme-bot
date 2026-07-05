@@ -53,3 +53,11 @@ JUPITER_API_URL: str = _get(
 # Never hardcode — read from .env. Dexscreener needs no key.
 BIRDEYE_API_KEY: Optional[str] = _get("BIRDEYE_API_KEY")
 HELIUS_API_KEY: Optional[str] = _get("HELIUS_API_KEY")
+
+# --- Curated KOL / smart-money wallets (optional) ----------------------------
+# Comma-separated Solana wallet addresses read from .env, used ONLY as a
+# read-only meta signal (does a tracked wallet hold a token). Never a trigger.
+# Empty when unset. Never hardcode real addresses here — keep them in .env.
+KOL_WALLETS: list[str] = [
+    w.strip() for w in (_get("KOL_WALLETS", "") or "").split(",") if w.strip()
+]

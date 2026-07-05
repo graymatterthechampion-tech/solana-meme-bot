@@ -16,14 +16,16 @@ CREDENTIALS
 -----------
 API keys / RPC URLs are read from ``.env`` via ``config`` and never hardcoded.
 
-TODO(real-apis): wire real providers in ``_fetch_raw``:
-    * Dexscreener — GET https://api.dexscreener.com/latest/dex/tokens/{address}
-      (no key) for price / liquidity / volume.
-    * Birdeye — GET https://public-api.birdeye.so/... with header
-      ``X-API-KEY: config.BIRDEYE_API_KEY`` for OHLCV / rolling volume.
-    * Helius — RPC via ``config.RPC_URL`` (``config.HELIUS_API_KEY``) for
-      on-chain wallet activity (largest single sell, coordinated top-wallet
-      dumps). Cross-check fields across sources before trusting them.
+The live feed (:func:`get_live_market_snapshot`) is wired to real providers:
+    * Dexscreener — current pool liquidity (USD).
+    * Birdeye 1m OHLCV (via :mod:`data.price_history`) — price / 1m candle /
+      rolling + peak 15m volume.
+    * Helius RPC (via :mod:`data.onchain`, ``config.RPC_URL`` /
+      ``config.HELIUS_API_KEY``) — read-only coordinated-dump signals (largest
+      single sell, distinct selling wallets). Fail-closed and non-fatal.
+
+The legacy ``_fetch_raw`` / :func:`get_market_snapshot` remain a placeholder
+single-endpoint path (tests inject a mock client).
 
 TODO(execution-realism): dry-run execution currently logs intended sells with
 zero market friction. Before any live trading, model realistic SLIPPAGE,
@@ -39,6 +41,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 import httpx
 
 import config
+from data.onchain import OnchainFlow, get_recent_flow
 from data.price_history import OHLCVHistory, get_price_history
 from strategies.hard_exit import MarketData
 
@@ -62,6 +65,10 @@ ROLLING_WINDOW: int = 15           # candles per rolling window (15 x 1m = 15m)
 
 # Async OHLCV source: mint -> recent history (injectable for tests).
 HistoryFetcher = Callable[..., Awaitable[Optional[OHLCVHistory]]]
+
+# Async read-only on-chain flow source (injectable for tests). Fail-closed: it
+# returns an OnchainFlow (available=False, zeros) rather than raising.
+FlowFetcher = Callable[..., Awaitable[OnchainFlow]]
 
 # Every field the loop needs. If ANY is absent the snapshot is rejected.
 REQUIRED_RAW_FIELDS: List[str] = [
@@ -225,6 +232,33 @@ def _derive_volume_metrics(
     return rolling_15m, peak, last.open, last.close
 
 
+async def _safe_flow(
+    fetch_flow: FlowFetcher,
+    token_address: str,
+    *,
+    price: float,
+    client: httpx.AsyncClient,
+    timeout: float,
+    rpc_url: Optional[str],
+) -> OnchainFlow:
+    """Call the flow fetcher, guaranteeing it never propagates an exception.
+
+    ``get_recent_flow`` is already fail-closed, but this belt-and-braces guard
+    means even a buggy injected fetcher degrades to an absent signal instead of
+    crashing the feed or forcing a false-closed ``None`` snapshot.
+    """
+    try:
+        return await fetch_flow(
+            token_address, price=price, client=client, timeout=timeout, rpc_url=rpc_url
+        )
+    except Exception as exc:  # noqa: BLE001 — dump signal is strictly additive
+        logger.warning(
+            "[feed] on-chain flow fetch failed for %s: %s -> dump signal absent",
+            token_address, exc,
+        )
+        return OnchainFlow()
+
+
 async def get_live_market_snapshot(
     token_address: str,
     entry_liquidity: float,
@@ -233,6 +267,8 @@ async def get_live_market_snapshot(
     timeout: float = DEFAULT_TIMEOUT,
     birdeye_api_key: Optional[str] = None,
     history_fetcher: Optional[HistoryFetcher] = None,
+    flow_fetcher: Optional[FlowFetcher] = None,
+    helius_rpc_url: Optional[str] = None,
     now: Optional[float] = None,
 ) -> Optional[MarketData]:
     """Assemble a REAL :class:`MarketData` snapshot for the management loop.
@@ -244,12 +280,16 @@ async def get_live_market_snapshot(
         * Birdeye 1m OHLCV (via :func:`data.price_history.get_price_history`) —
           current price (latest close), the latest 1m candle, and the rolling /
           peak 15m volume derived from the candles.
+        * Helius (via :func:`data.onchain.get_recent_flow`) — the trade-level
+          coordinated-dump signals ``largest_single_sell`` and
+          ``top_wallet_sells``, valued in USD against the current price so they
+          are comparable with the Dexscreener liquidity.
 
-    Trade-level on-chain signals (``largest_single_sell``, ``top_wallet_sells``)
-    require Helius enhanced-tx history and are NOT sourced here yet; they stay
-    at their benign ``0`` defaults. That is safe by construction: those two
-    fields can only ever ADD a hard-exit trigger, never mask one, so leaving
-    them inactive cannot make an unsafe position look safe.
+    The Helius flow fetch is fail-closed and NON-fatal: if it errors, times out,
+    is unconfigured, or returns nothing, the two dump fields simply stay at their
+    benign ``0`` and the rest of the snapshot is unaffected. That is safe by
+    construction — those fields can only ever ADD a hard-exit trigger, never mask
+    one, so an absent Helius signal can't make an unsafe position look safe.
 
     Returns ``None`` on any error, missing core data (price/liquidity), or fewer
     than one full 15m window of 1m candles — the loop treats ``None`` as
@@ -259,6 +299,7 @@ async def get_live_market_snapshot(
     if own_client:
         client = httpx.AsyncClient(timeout=timeout)
     fetch_history = history_fetcher or get_price_history
+    fetch_flow = flow_fetcher or get_recent_flow
 
     try:
         liquidity = await _fetch_dexscreener_liquidity(
@@ -285,13 +326,23 @@ async def get_live_market_snapshot(
             return None
 
         rolling_15m, peak_15m, c_open, c_close = _derive_volume_metrics(history)
+        price = history.current_price
+
+        # Helius coordinated-dump signals. Fail-closed and non-fatal: any error
+        # leaves an absent (zeroed) flow, so the dump trigger stays dormant
+        # rather than the whole snapshot failing closed to None.
+        flow = await _safe_flow(
+            fetch_flow, token_address, price=price, client=client,
+            timeout=timeout, rpc_url=helius_rpc_url,
+        )
+
         raw: Dict[str, Any] = {
-            "price": history.current_price,   # latest 1m close (Birdeye)
+            "price": price,                   # latest 1m close (Birdeye)
             "volume_15m": rolling_15m,
             "peak_volume_15m": peak_15m,
             "liquidity": liquidity,           # Dexscreener
-            "largest_single_sell": 0.0,       # Helius-only signal; inactive
-            "top_wallet_sells": 0,            # Helius-only signal; inactive
+            "largest_single_sell": flow.largest_single_sell_usd,  # Helius
+            "top_wallet_sells": flow.selling_wallets,             # Helius
             "candle_1m_open": c_open,
             "candle_1m_close": c_close,
         }

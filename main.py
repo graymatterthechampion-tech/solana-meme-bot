@@ -20,7 +20,7 @@ import logging
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 import config
 from data.market_feed import get_live_market_snapshot, mock_market_snapshot
@@ -34,6 +34,7 @@ from safety.rug_check import (
     SafetyReport,
     evaluate_token_safety,
 )
+from scanner.meta_rank import MetaBoost, NEUTRAL_BOOST, rank_boost_for
 from scanner.token_scanner import scan_candidates
 from strategies import hard_exit, profit_taking
 from strategies.entry import (
@@ -42,6 +43,7 @@ from strategies.entry import (
     EntryMarketData,
     evaluate_entry,
 )
+from strategies.entry_momentum import MomentumDecision, evaluate_entry_momentum
 from strategies.hard_exit import ExitDecision, MarketData
 from strategies.profit_taking import Position, SellAction
 
@@ -50,6 +52,27 @@ DEFAULT_MAX_CANDIDATES: int = 5
 
 # Default seconds to sleep between cycles in continuous (--loop) mode.
 DEFAULT_INTERVAL_SECONDS: float = 60.0
+
+# --- Entry strategy selection ----------------------------------------------
+STRATEGY_DIP: str = "dip"              # post-pump dip-buy only
+STRATEGY_MOMENTUM: str = "momentum"    # momentum/breakout only
+STRATEGY_BOTH: str = "both"            # try dip first, then momentum; first BUY wins
+STRATEGY_CHOICES: tuple[str, ...] = (STRATEGY_DIP, STRATEGY_MOMENTUM, STRATEGY_BOTH)
+DEFAULT_STRATEGY: str = STRATEGY_BOTH
+
+# Either entry strategy's decision; both share the ``action`` / ``position`` /
+# ``entry_liquidity`` shape the pipeline reads, so callers treat them uniformly.
+AnyEntryDecision = Union[EntryDecision, MomentumDecision]
+
+# How informative a non-BUY decision's reason is. A WAIT is a near-miss ("valid
+# setup, timing not ready") and explains the pass-on better than a SKIP
+# ("did not qualify"), so it ranks higher. Used only to pick which strategy's
+# reason to surface in "both" mode when neither returns BUY.
+_ACTION_INFORMATIVENESS: Dict[EntryAction, int] = {
+    EntryAction.SKIP: 0,
+    EntryAction.WAIT: 1,
+    EntryAction.BUY: 2,
+}
 
 # Async safety gate: mint -> read-only SafetyReport.
 SafetyChecker = Callable[[str], Awaitable[SafetyReport]]
@@ -62,6 +85,11 @@ HistoryFetcher = Callable[[str], Awaitable[Optional[OHLCVHistory]]]
 
 # Async source that yields a snapshot (or None, fail-closed) for a token.
 SnapshotProvider = Callable[[str, float], Awaitable[Optional[MarketData]]]
+
+# Async meta ranking boost for an already-entered token: (mint, entry_price) ->
+# MetaBoost (>= 1.0). Injectable; the default is a no-network neutral boost so
+# library/test use never touches Helius. main() wires the live provider.
+MetaBoostProvider = Callable[[str, float], Awaitable[MetaBoost]]
 
 # Async one-cycle scan+evaluate (defaults to scan_and_evaluate); injectable in
 # tests. Accepts the scan_and_evaluate keyword arguments and returns its sessions.
@@ -251,19 +279,110 @@ class TradeSession:
         "rejected_safety" safety gate failed; entry never evaluated
         "no_entry"        safety passed but entry was WAIT/SKIP; no position
         "entered"         safety + BUY; a position was opened and the loop ran
+
+    ``meta_boost`` / ``priority_score`` are populated ONLY for "entered" tokens
+    (safe + momentum-backed BUY). The meta layer is a ranking boost, never a
+    trigger: it is computed strictly after the BUY and feeds nothing upstream.
+    ``priority_score`` is the base priority times the meta boost; it is 0.0 for
+    every non-entered session (nothing was bought to rank).
     """
 
     mint_address: str
     status: str
     safety_report: Optional[SafetyReport] = None
-    entry_decision: Optional[EntryDecision] = None
+    entry_decision: Optional[AnyEntryDecision] = None
     position: Optional[Position] = None
     loop_outcomes: List[Optional[LoopOutcome]] = field(default_factory=list)
+    symbol: str = "?"
+    meta_boost: Optional[MetaBoost] = None
+    priority_score: float = 0.0
+
+
+# Base priority every entered token starts from before the meta boost is applied.
+META_BASE_PRIORITY: float = 1.0
+
+
+def meta_ranked_entries(sessions: List["TradeSession"]) -> List["TradeSession"]:
+    """Return the ENTERED sessions ordered by meta-boosted priority (desc).
+
+    Only tokens that actually opened a position are rankable; everything else has
+    no priority to compare. The sort is stable, so equal-priority entries keep
+    their original (discovery) order. This is a pure overlay — it never drops or
+    re-orders the source ``sessions`` list itself.
+    """
+    entered = [s for s in sessions if s.status == "entered"]
+    entered.sort(key=lambda s: s.priority_score, reverse=True)
+    return entered
 
 
 async def _default_safety_checker(mint_address: str) -> SafetyReport:
     """Default gate: the live read-only safety / rug check."""
     return await evaluate_token_safety(mint_address)
+
+
+async def _neutral_meta_boost_provider(mint_address: str, price: float) -> MetaBoost:
+    """Default meta provider: a no-network neutral boost (1.0).
+
+    Keeps library/test use fully hermetic — the meta ranking is inert unless a
+    live provider is explicitly wired in (see :func:`_live_meta_boost_provider`,
+    used by ``main()``). A neutral boost can only ever leave an entry un-ranked,
+    never block it.
+    """
+    return NEUTRAL_BOOST
+
+
+async def _live_meta_boost_provider(mint_address: str, price: float) -> MetaBoost:
+    """Live meta provider: read-only Helius buyer-breadth + KOL-holdings boost.
+
+    Fail-closed (:func:`scanner.meta_rank.rank_boost_for` never raises and
+    returns a neutral 1.0 on any error / missing endpoint).
+    """
+    return await rank_boost_for(mint_address, price)
+
+
+async def evaluate_entry_strategy(
+    mint_address: str,
+    entry_market: EntryMarketData,
+    *,
+    strategy: str = DEFAULT_STRATEGY,
+    dry_run: bool = True,
+) -> AnyEntryDecision:
+    """Run the selected entry strategy (or both) and return one decision.
+
+    * ``"dip"``      — only the post-pump dip-buy (:func:`evaluate_entry`).
+    * ``"momentum"`` — only the breakout (:func:`evaluate_entry_momentum`).
+    * ``"both"``     — evaluate the dip FIRST, then momentum, and take the first
+      that returns BUY. If neither BUYs, surface the MORE INFORMATIVE decision
+      (a WAIT near-miss over a SKIP rejection), tie-breaking to the dip (the
+      primary strategy) so the reported reason is deterministic.
+
+    ``evaluate_entry`` is looked up via the module global so tests that patch
+    ``main.evaluate_entry`` still intercept it.
+    """
+    if strategy == STRATEGY_MOMENTUM:
+        return await evaluate_entry_momentum(mint_address, entry_market, dry_run=dry_run)
+    if strategy == STRATEGY_DIP:
+        return await evaluate_entry(mint_address, entry_market, dry_run=dry_run)
+
+    # "both": dip is primary; the first BUY wins.
+    dip_decision = await evaluate_entry(mint_address, entry_market, dry_run=dry_run)
+    if dip_decision.action is EntryAction.BUY:
+        return dip_decision
+    momentum_decision = await evaluate_entry_momentum(
+        mint_address, entry_market, dry_run=dry_run
+    )
+    if momentum_decision.action is EntryAction.BUY:
+        return momentum_decision
+
+    # Neither bought: report whichever pass-on reason is more informative. The
+    # dip is compared first, so an equally-ranked momentum decision does NOT
+    # displace it (deterministic tie-break to the primary strategy).
+    if (
+        _ACTION_INFORMATIVENESS[momentum_decision.action]
+        > _ACTION_INFORMATIVENESS[dip_decision.action]
+    ):
+        return momentum_decision
+    return dip_decision
 
 
 async def evaluate_and_trade(
@@ -272,8 +391,11 @@ async def evaluate_and_trade(
     *,
     max_iterations: int,
     dry_run: bool = True,
+    strategy: str = DEFAULT_STRATEGY,
+    symbol: str = "?",
     safety_checker: SafetyChecker = _default_safety_checker,
     snapshot_provider: SnapshotProvider = mock_market_snapshot,
+    meta_boost_provider: MetaBoostProvider = _neutral_meta_boost_provider,
 ) -> TradeSession:
     """Run the full candidate pipeline: safety gate -> entry -> manage loop.
 
@@ -284,6 +406,11 @@ async def evaluate_and_trade(
         2. Entry decision. Only a BUY opens a position; WAIT/SKIP open nothing.
         3. On BUY, hand the sized :class:`Position` to :func:`run_loop`, which
            manages it with the mandated hard-exit-first priority.
+        4. ONLY on a completed BUY, compute the meta ranking boost
+           (``meta_boost_provider``) from read-only on-chain signals. This is a
+           pure ranking annotation — it runs after the trade is decided and
+           feeds nothing upstream, so it can never trigger a buy or relax the
+           safety/entry bars. It is fail-closed to a neutral 1.0.
 
     Returns a :class:`TradeSession` describing how far the candidate got.
     """
@@ -299,12 +426,18 @@ async def evaluate_and_trade(
             mint_address=mint_address,
             status="rejected_safety",
             safety_report=report,
+            symbol=symbol,
         )
 
-    logger.info("[trade] %s passed safety gate -> evaluating entry", mint_address)
+    logger.info(
+        "[trade] %s passed safety gate -> evaluating entry (strategy=%s)",
+        mint_address, strategy,
+    )
 
     # --- 2. Entry decision: only BUY opens a position ----------------------
-    decision = await evaluate_entry(mint_address, entry_market, dry_run=dry_run)
+    decision = await evaluate_entry_strategy(
+        mint_address, entry_market, strategy=strategy, dry_run=dry_run
+    )
     if decision.action is not EntryAction.BUY:
         logger.info(
             "[trade] %s no position opened (entry=%s: %s)",
@@ -317,6 +450,7 @@ async def evaluate_and_trade(
             status="no_entry",
             safety_report=report,
             entry_decision=decision,
+            symbol=symbol,
         )
 
     # --- 3. BUY: open the position and manage it in the loop ---------------
@@ -343,6 +477,17 @@ async def evaluate_and_trade(
         "[trade] %s managed -> simulated realised PnL = $%.2f over %d fill(s)",
         mint_address, pnl, n_fills,
     )
+
+    # --- 4. META RANKING (boost only; strictly AFTER the BUY is decided) ----
+    # Consumes read-only on-chain signals (buyer breadth + KOL holdings). It can
+    # only ever RAISE this entry's priority relative to other entries; it is
+    # fail-closed to a neutral 1.0 and can never veto, block, or shrink a token.
+    boost = await meta_boost_provider(mint_address, position.entry_price)
+    priority = META_BASE_PRIORITY * boost.boost
+    logger.info(
+        "[meta] %s (%s) rank boost=x%.2f priority=%.2f | %s",
+        mint_address, symbol, boost.boost, priority, boost.reason,
+    )
     return TradeSession(
         mint_address=mint_address,
         status="entered",
@@ -350,6 +495,9 @@ async def evaluate_and_trade(
         entry_decision=decision,
         position=position,
         loop_outcomes=outcomes,
+        symbol=symbol,
+        meta_boost=boost,
+        priority_score=priority,
     )
 
 
@@ -395,10 +543,12 @@ async def scan_and_evaluate(
     max_candidates: int = DEFAULT_MAX_CANDIDATES,
     max_iterations: int = 5,
     dry_run: bool = True,
+    strategy: str = DEFAULT_STRATEGY,
     scanner: CandidateScanner = scan_candidates,
     safety_checker: SafetyChecker = _default_safety_checker,
     entry_market_provider: EntryMarketProvider = _default_entry_market_provider,
     snapshot_provider: SnapshotProvider = mock_market_snapshot,
+    meta_boost_provider: MetaBoostProvider = _neutral_meta_boost_provider,
 ) -> List[TradeSession]:
     """Discover live candidates and run each through the full pipeline.
 
@@ -451,7 +601,7 @@ async def scan_and_evaluate(
                 mint,
             )
             sessions.append(
-                TradeSession(mint_address=mint, status="no_market_data")
+                TradeSession(mint_address=mint, status="no_market_data", symbol=symbol)
             )
             continue
 
@@ -460,8 +610,11 @@ async def scan_and_evaluate(
             entry_market,
             max_iterations=max_iterations,
             dry_run=dry_run,
+            strategy=strategy,
+            symbol=symbol,
             safety_checker=safety_checker,
             snapshot_provider=snapshot_provider,
+            meta_boost_provider=meta_boost_provider,
         )
         logger.info(
             "[scan %d/%d] %s (%s) -> %s",
@@ -479,6 +632,18 @@ async def scan_and_evaluate(
         len(sessions),
         dict(summary),
     )
+
+    # Meta-boosted priority order of the genuine (entered) setups. Ranking only;
+    # the returned list stays in discovery order and no entry is added/removed.
+    ranked = meta_ranked_entries(sessions)
+    if ranked:
+        logger.info(
+            "[meta] entry priority (best first): %s",
+            [
+                f"{s.symbol}:{s.mint_address}=x{(s.meta_boost.boost if s.meta_boost else 1.0):.2f}"
+                for s in ranked
+            ],
+        )
     return sessions
 
 
@@ -537,8 +702,10 @@ async def run_continuous(
     max_candidates: int = DEFAULT_MAX_CANDIDATES,
     max_iterations: int = 5,
     dry_run: bool = True,
+    strategy: str = DEFAULT_STRATEGY,
     scan: ContinuousScan = scan_and_evaluate,
     snapshot_provider: SnapshotProvider = mock_market_snapshot,
+    meta_boost_provider: MetaBoostProvider = _neutral_meta_boost_provider,
     sleep: AsyncSleep = asyncio.sleep,
     max_cycles: Optional[int] = None,
     stats: Optional[CumulativeStats] = None,
@@ -579,7 +746,9 @@ async def run_continuous(
                 max_candidates=max_candidates,
                 max_iterations=max_iterations,
                 dry_run=dry_run,
+                strategy=strategy,
                 snapshot_provider=snapshot_provider,
+                meta_boost_provider=meta_boost_provider,
             )
             stats.record_cycle(sessions)
             logger.info(
@@ -663,6 +832,18 @@ def parse_args() -> argparse.Namespace:
             f"(default: {DEFAULT_INTERVAL_SECONDS:.0f})."
         ),
     )
+    parser.add_argument(
+        "--strategy",
+        dest="strategy",
+        choices=STRATEGY_CHOICES,
+        default=DEFAULT_STRATEGY,
+        help=(
+            "Entry strategy to evaluate each safety-passed candidate with: "
+            "'dip' (post-pump dip-buy), 'momentum' (breakout), or 'both' "
+            "(dip first, then momentum; first BUY wins) "
+            f"(default: {DEFAULT_STRATEGY})."
+        ),
+    )
 
     return parser.parse_args()
 
@@ -714,7 +895,10 @@ def main() -> None:
 
     mode = "DRY-RUN" if args.dry_run else "LIVE"
     print_banner(mode, config.SOLANA_NETWORK)
-    logger.info("[startup] Helix Vector 1.0 | mode=%s network=%s", mode, config.SOLANA_NETWORK)
+    logger.info(
+        "[startup] Helix Vector 1.0 | mode=%s network=%s strategy=%s",
+        mode, config.SOLANA_NETWORK, args.strategy,
+    )
 
     if not args.dry_run:
         logger.info("[startup] LIVE mode requested — trading logic not implemented yet.")
@@ -735,7 +919,9 @@ def main() -> None:
                     max_candidates=args.max_candidates,
                     max_iterations=args.iterations,
                     dry_run=args.dry_run,
+                    strategy=args.strategy,
                     snapshot_provider=get_live_market_snapshot,
+                    meta_boost_provider=_live_meta_boost_provider,
                     stats=stats,
                 )
             )
@@ -759,7 +945,9 @@ def main() -> None:
             max_candidates=args.max_candidates,
             max_iterations=args.iterations,
             dry_run=args.dry_run,
+            strategy=args.strategy,
             snapshot_provider=get_live_market_snapshot,
+            meta_boost_provider=_live_meta_boost_provider,
         )
     )
     summary = Counter(s.status for s in sessions)
