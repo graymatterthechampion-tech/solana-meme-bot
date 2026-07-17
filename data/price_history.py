@@ -11,17 +11,42 @@ STRICTLY READ-ONLY
 HTTP GETs and pure derivation only. This module imports no signer, keypair, or
 transaction-building code and never buys, sells, signs, or broadcasts.
 
-DATA SOURCES
-------------
-PRIMARY  — Birdeye OHLCV API (``/defi/ohlcv``). Requires an API key, read from
-           ``.env`` via ``config.BIRDEYE_API_KEY`` (never hardcoded). Returns
-           real per-interval candles, the highest-fidelity source for ATH /
-           pullback / consolidation / volume-spike math.
-FALLBACK — Dexscreener token API (public, no key). When Birdeye fails, is
-           unconfigured, or returns too little data, a COARSE recent series is
-           reconstructed from Dexscreener's trailing price-change / volume
-           buckets (m5/h1/h6/h24). Best-effort: enough to evaluate, never a
-           substitute for true candles.
+DATA SOURCES (tried in priority order)
+--------------------------------------
+PRIMARY   — GeckoTerminal public API (``api.geckoterminal.com/api/v2``). FREE, no
+            API key. Two read-only GETs per token: token -> deepest pool
+            (``/networks/solana/tokens/{mint}/pools``), then real OHLCV candles for
+            that pool (``/networks/solana/pools/{pool}/ohlcv/{timeframe}``). Returns
+            true per-interval candles — the same fidelity as Birdeye — at zero cost,
+            so it leads the chain.
+
+            RATE-LIMITED: the free tier allows only ~30 calls/min (and can be as low
+            as ~10). Every GeckoTerminal call is spaced by a strict client-side
+            throttle (:func:`_gecko_throttle`, min interval
+            :data:`GECKO_MIN_CALL_INTERVAL`) so the bot proactively stays under the
+            limit. If a 429 slips through anyway it is retried with backoff by the
+            shared request path and, on exhaustion, falls through to the next source
+            — never blocking the trading loop.
+SECONDARY — Birdeye OHLCV API (``/defi/ohlcv``). Requires an API key, read from
+            ``.env`` via ``config.BIRDEYE_API_KEY`` (never hardcoded). Used only when
+            GeckoTerminal yields nothing usable; resumes automatically once a Birdeye
+            quota resets.
+
+            PLAN-GATED: Birdeye answers OHLCV with ``400 {"success":false,
+            "message":"Compute units usage limit exceeded"}`` on API plans that do
+            not grant the historical/time-series endpoints — regardless of headers,
+            candle count, or endpoint version (``/defi/ohlcv`` and ``/defi/v3/ohlcv``
+            behave identically; ``/defi/price`` and ``/defi/token_overview`` still
+            return 200 on the same key, which is how you tell a plan gate apart
+            from an exhausted quota). That is a PERMANENT rejection, not a
+            transient error, so the first one trips a circuit breaker
+            (:func:`birdeye_status`) and every later call skips straight to the
+            fallback instead of re-billing a round-trip per token per scan.
+LAST-RESORT — Dexscreener token API (public, no key). When BOTH real-candle sources
+            fail, are unconfigured, or return too little data, a COARSE recent series
+            is reconstructed from Dexscreener's trailing price-change / volume
+            buckets (m5/h1/h6/h24). Best-effort: enough to evaluate, never a
+            substitute for true candles.
 
 FAIL-CLOSED CONTRACT
 --------------------
@@ -39,7 +64,9 @@ honoring a server ``Retry-After`` on 429, otherwise exponential backoff.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -56,16 +83,36 @@ from strategies.entry import EntryMarketData
 logger = logging.getLogger(__name__)
 
 # --- Endpoints (read-only) --------------------------------------------------
+GECKOTERMINAL_BASE: str = "https://api.geckoterminal.com/api/v2"
 BIRDEYE_OHLCV_URL: str = "https://public-api.birdeye.so/defi/ohlcv"
 DEXSCREENER_TOKENS_URL: str = "https://api.dexscreener.com/latest/dex/tokens"
 CHAIN: str = "solana"
 
 # --- Defaults (tunable) -----------------------------------------------------
-DEFAULT_INTERVAL: str = "5m"          # Birdeye candle width
+DEFAULT_INTERVAL: str = "5m"          # candle width (Birdeye-style key, mapped per source)
 DEFAULT_LOOKBACK_HOURS: float = 24.0  # how far back to request candles
-DEFAULT_MIN_CANDLES: int = 5          # fewer Birdeye candles -> insufficient
+DEFAULT_MIN_CANDLES: int = 5          # fewer real candles -> insufficient
 DEFAULT_TIMEOUT: float = 8.0          # per-request timeout (seconds)
 FALLBACK_MIN_POINTS: int = 2          # fewer fallback points -> unusable
+
+# --- GeckoTerminal free-tier limits (tunable) -------------------------------
+# The free tier caps OHLCV requests at 1000 candles and the whole API at ~30
+# calls/min (and can be throttled to as low as ~10). We SELF-limit below 30 with
+# headroom; each token costs two calls (pool lookup + OHLCV), so ~25 calls/min is
+# ~12 tokens/min. If you observe 429s, lower GECKO_RATE_LIMIT_PER_MIN toward 10.
+GECKO_OHLCV_MAX_LIMIT: int = 1000
+GECKO_RATE_LIMIT_PER_MIN: float = 25.0
+# Minimum seconds between two consecutive GeckoTerminal calls (module global so
+# tests can zero it to skip real sleeping). Derived from the per-minute budget.
+GECKO_MIN_CALL_INTERVAL: float = 60.0 / GECKO_RATE_LIMIT_PER_MIN
+
+# Map a Birdeye-style candle key to GeckoTerminal's (timeframe, aggregate). Only
+# widths the free OHLCV endpoint actually supports; anything else -> 5-minute.
+_GECKO_TIMEFRAME: Dict[str, Tuple[str, int]] = {
+    "1m": ("minute", 1), "5m": ("minute", 5), "15m": ("minute", 15),
+    "1H": ("hour", 1), "4H": ("hour", 4), "12H": ("hour", 12),
+    "1D": ("day", 1),
+}
 
 # Coarse, irregular spacing for the Dexscreener fallback series; the two most
 # recent points (m5 -> now) are ~5 minutes apart, which is what the entry
@@ -78,6 +125,19 @@ _INTERVAL_MINUTES: Dict[str, float] = {
     "1H": 60.0, "2H": 120.0, "4H": 240.0, "6H": 360.0, "8H": 480.0,
     "12H": 720.0, "1D": 1440.0,
 }
+
+# HTTP statuses from Birdeye that are PERMANENT rejections of the request as
+# posed (bad params, dead key, or an endpoint the plan does not grant). Retrying
+# or re-requesting these for the next token cannot help, so the first one trips
+# the circuit breaker below. 429/5xx are deliberately absent: those ARE transient
+# and are already retried with backoff inside _request_json.
+BIRDEYE_FATAL_STATUSES: Tuple[int, ...] = (400, 401, 402, 403)
+
+# Set to the reason string once Birdeye permanently rejects us; while set, the
+# Birdeye leg is skipped entirely and we serve history from Dexscreener. Process
+# lifetime only — restarting the bot (e.g. after upgrading the API plan) re-arms
+# Birdeye. Tests reset it via reset_birdeye_circuit().
+_birdeye_disabled_reason: Optional[str] = None
 
 # Trailing Dexscreener buckets, oldest window first: (key, seconds_ago).
 _DEX_WINDOWS: Tuple[Tuple[str, float], ...] = (
@@ -157,6 +217,201 @@ def _interval_to_minutes(interval: str) -> float:
     return _INTERVAL_MINUTES.get(interval, 5.0)
 
 
+def _gecko_timeframe(interval: str) -> Tuple[str, int]:
+    """Map a candle key to GeckoTerminal ``(timeframe, aggregate)`` (default 5m)."""
+    return _GECKO_TIMEFRAME.get(interval, ("minute", 5))
+
+
+# --- GeckoTerminal client-side rate limiter ---------------------------------
+# The free tier limits the WHOLE API (not per endpoint) to ~30 calls/min, so we
+# serialise every GeckoTerminal call through one throttle and space consecutive
+# calls by at least GECKO_MIN_CALL_INTERVAL. This is proactive (avoid the 429),
+# complementing the reactive 429 backoff already in _request_json.
+
+# monotonic timestamp of the last GeckoTerminal call let through the throttle.
+_gecko_last_call: float = 0.0
+# Serialises the throttle. Created lazily and rebound if the running event loop
+# changes (each asyncio.run() in tests is a fresh loop), so a lock is never
+# awaited from a loop it was not created on.
+_gecko_lock: Optional[asyncio.Lock] = None
+_gecko_lock_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _gecko_throttle_lock() -> asyncio.Lock:
+    """Return a lock bound to the currently running event loop."""
+    global _gecko_lock, _gecko_lock_loop
+    loop = asyncio.get_running_loop()
+    if _gecko_lock is None or _gecko_lock_loop is not loop:
+        _gecko_lock = asyncio.Lock()
+        _gecko_lock_loop = loop
+    return _gecko_lock
+
+
+def reset_gecko_throttle() -> None:
+    """Clear the throttle's last-call clock (used by tests)."""
+    global _gecko_last_call
+    _gecko_last_call = 0.0
+
+
+async def _gecko_throttle() -> None:
+    """Block until at least :data:`GECKO_MIN_CALL_INTERVAL` has passed since the
+    previous GeckoTerminal call, so the free-tier per-minute budget is respected.
+
+    A non-positive interval disables throttling entirely (tests set it to 0).
+    """
+    global _gecko_last_call
+    interval = GECKO_MIN_CALL_INTERVAL
+    if interval <= 0:
+        return
+    async with _gecko_throttle_lock():
+        wait = _gecko_last_call + interval - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _gecko_last_call = time.monotonic()
+
+
+# --- GeckoTerminal (primary) ------------------------------------------------
+
+def _gecko_top_pool_address(data: Dict[str, Any]) -> Optional[str]:
+    """Pick the deepest-liquidity pool address from a token->pools response.
+
+    Each item's ``attributes.reserve_in_usd`` is the pool's total liquidity; the
+    highest wins (GeckoTerminal usually returns them liquidity-sorted already, but
+    we do not rely on that). Returns ``None`` if no pool carries an address.
+    """
+    best: Optional[str] = None
+    best_liq = -1.0
+    for pool in (data or {}).get("data") or []:
+        attrs = pool.get("attributes") or {}
+        address = attrs.get("address")
+        if not address:
+            continue
+        liq = _as_float(attrs.get("reserve_in_usd")) or 0.0
+        if liq > best_liq:
+            best, best_liq = str(address), liq
+    return best
+
+
+def _geckoterminal_to_history(
+    mint_address: str, data: Dict[str, Any], interval: str
+) -> Optional[OHLCVHistory]:
+    """Parse a GeckoTerminal OHLCV payload into history, or ``None`` if empty.
+
+    ``data.attributes.ohlcv_list`` is a list of ``[unixTime, o, h, l, c, v]`` rows
+    (GeckoTerminal returns them newest-first; we sort chronologically). Each row
+    must be complete, numeric, and carry a positive close/high (fail-closed per row).
+    """
+    ohlcv_list = (
+        ((data or {}).get("data") or {}).get("attributes") or {}
+    ).get("ohlcv_list") or []
+    candles: List[Candle] = []
+    for row in ohlcv_list:
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            continue
+        ts = _as_float(row[0])
+        o = _as_float(row[1])
+        h = _as_float(row[2])
+        low = _as_float(row[3])
+        c = _as_float(row[4])
+        v = _as_float(row[5])
+        if None in (ts, o, h, low, c, v):
+            continue  # incomplete row -> skip (fail-closed per row)
+        if c <= 0 or h <= 0:
+            continue
+        candles.append(
+            Candle(
+                timestamp=ts, open=o, high=h, low=low, close=c, volume=max(0.0, v)
+            )
+        )
+
+    if not candles:
+        return None
+    candles.sort(key=lambda candle: candle.timestamp)
+    return OHLCVHistory(
+        mint_address=mint_address,
+        interval_minutes=_interval_to_minutes(interval),
+        source="geckoterminal",
+        candles=candles,
+    )
+
+
+async def _fetch_geckoterminal(
+    client: httpx.AsyncClient,
+    mint_address: str,
+    *,
+    interval: str,
+    lookback_hours: float,
+    min_candles: int,
+    timeout: float,
+) -> Optional[OHLCVHistory]:
+    """Read-only two-step GeckoTerminal fetch: token -> deepest pool -> OHLCV.
+
+    FREE and keyless. Every call is spaced by :func:`_gecko_throttle` to stay under
+    the free-tier rate limit. Returns ``None`` when the token has no pool or the
+    OHLCV payload is empty; RAISES on transport/HTTP error (incl. a 429 that
+    survived :func:`_request_json`'s backoff) so the caller falls through the chain.
+    """
+    # Step 1: token -> its pools, pick the deepest.
+    pools_url = f"{GECKOTERMINAL_BASE}/networks/{CHAIN}/tokens/{mint_address}/pools"
+    await _gecko_throttle()
+    pools_data = await _request_json(
+        client, "GET", pools_url, headers={"Accept": "application/json"},
+        timeout=timeout, label="geckoterminal-pools",
+    )
+    pool_address = _gecko_top_pool_address(pools_data)
+    if pool_address is None:
+        logger.info(
+            "[price_history] %s no GeckoTerminal pool -> next source", mint_address
+        )
+        return None
+
+    # Step 2: pool -> OHLCV candles. Request only as many candles as the lookback
+    # window needs (capped at the free-tier max), never fewer than min_candles.
+    timeframe, aggregate = _gecko_timeframe(interval)
+    interval_minutes = _interval_to_minutes(interval)
+    wanted = math.ceil(lookback_hours * 60.0 / interval_minutes) if interval_minutes > 0 else min_candles
+    limit = max(min_candles, min(GECKO_OHLCV_MAX_LIMIT, wanted))
+    ohlcv_url = str(
+        httpx.URL(
+            f"{GECKOTERMINAL_BASE}/networks/{CHAIN}/pools/{pool_address}/ohlcv/{timeframe}",
+            params={"aggregate": aggregate, "limit": limit},
+        )
+    )
+    await _gecko_throttle()
+    ohlcv_data = await _request_json(
+        client, "GET", ohlcv_url, headers={"Accept": "application/json"},
+        timeout=timeout, label="geckoterminal-ohlcv",
+    )
+    return _geckoterminal_to_history(mint_address, ohlcv_data, interval)
+
+
+# --- Birdeye circuit breaker ------------------------------------------------
+
+def birdeye_status() -> Optional[str]:
+    """Why the Birdeye leg is disabled, or ``None`` if it is still armed."""
+    return _birdeye_disabled_reason
+
+
+def reset_birdeye_circuit() -> None:
+    """Re-arm the Birdeye leg (used by tests, and on a fresh process)."""
+    global _birdeye_disabled_reason
+    _birdeye_disabled_reason = None
+
+
+def _disable_birdeye(reason: str) -> None:
+    """Trip the breaker once, logging loudly enough to be actionable."""
+    global _birdeye_disabled_reason
+    if _birdeye_disabled_reason is not None:
+        return
+    _birdeye_disabled_reason = reason
+    logger.error(
+        "[price_history] Birdeye permanently rejected us (%s) -> disabling the "
+        "Birdeye leg for this process; serving COARSE Dexscreener history "
+        "instead. Entry quality is degraded until the API plan/key is fixed.",
+        reason,
+    )
+
+
 # --- Birdeye (primary) ------------------------------------------------------
 
 def _birdeye_to_history(
@@ -204,12 +459,24 @@ async def _fetch_birdeye(
     api_key: Optional[str],
     now: float,
 ) -> Optional[OHLCVHistory]:
-    """Read-only GET of Birdeye OHLCV candles. Returns ``None`` (skip) when no
-    API key is configured; raises on transport/HTTP error so the caller falls
-    back. The retry/backoff path is reused via :func:`_request_json`."""
+    """Read-only GET of Birdeye OHLCV candles.
+
+    Returns ``None`` (skip -> caller falls back) when no API key is configured or
+    the circuit breaker is already tripped, and trips the breaker on a permanent
+    rejection (see :data:`BIRDEYE_FATAL_STATUSES`). Transient failures (429/5xx,
+    timeouts) still raise after :func:`_request_json` exhausts its backoff, so
+    the caller falls back for this token but Birdeye stays armed for the next.
+    """
     if not api_key:
         logger.info(
             "[price_history] no Birdeye API key (BIRDEYE_API_KEY) -> skip Birdeye"
+        )
+        return None
+
+    if _birdeye_disabled_reason is not None:
+        logger.debug(
+            "[price_history] Birdeye disabled (%s) -> fallback",
+            _birdeye_disabled_reason,
         )
         return None
 
@@ -231,10 +498,33 @@ async def _fetch_birdeye(
         "x-chain": CHAIN,
         "accept": "application/json",
     }
-    data = await _request_json(
-        client, "GET", url, headers=headers, timeout=timeout, label="birdeye"
-    )
+    try:
+        data = await _request_json(
+            client, "GET", url, headers=headers, timeout=timeout, label="birdeye"
+        )
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        if status in BIRDEYE_FATAL_STATUSES:
+            # _request_json has already logged the full body; carry the message
+            # into the breaker reason so the operator sees WHY, not just "400".
+            _disable_birdeye(f"HTTP {status}: {_birdeye_message(exc.response)}")
+            return None
+        raise  # transient (429/5xx exhausted) -> fall back, stay armed
+
     return _birdeye_to_history(mint_address, data, interval)
+
+
+def _birdeye_message(resp: httpx.Response) -> str:
+    """Birdeye's own error text (``{"success":false,"message":...}``), if any."""
+    try:
+        payload = resp.json()
+    except Exception:  # noqa: BLE001 — non-JSON error page
+        return "<non-JSON body>"
+    if isinstance(payload, dict):
+        message = payload.get("message") or payload.get("error")
+        if message:
+            return str(message)
+    return "<no message>"
 
 
 # --- Dexscreener (fallback) -------------------------------------------------
@@ -366,13 +656,17 @@ async def get_price_history(
     birdeye_api_key: Optional[str] = None,
     now: Optional[float] = None,
 ) -> Optional[OHLCVHistory]:
-    """Fetch recent OHLCV history for a mint: Birdeye first, Dexscreener fallback.
+    """Fetch recent OHLCV history for a mint through the source chain.
 
-    Read-only and fail-closed. Tries Birdeye (if an API key is configured) and
-    accepts it only with at least ``min_candles`` candles; otherwise — on any
-    error, empty/insufficient data, or no key — falls back to a coarse
-    Dexscreener series. Returns ``None`` if neither source yields usable
-    history, so the caller's entry decision stays fail-closed (SKIP).
+    Read-only and fail-closed. Tries sources in priority order and returns the
+    first that yields at least ``min_candles`` real candles:
+      1. GeckoTerminal (free, keyless, throttled) — real candles;
+      2. Birdeye (if an API key is configured) — real candles;
+      3. Dexscreener — a COARSE reconstructed series (accepted at
+         ``FALLBACK_MIN_POINTS`` points), last resort only.
+    On any error, empty/insufficient data, or missing config a source is skipped
+    and the next is tried. Returns ``None`` if none yields usable history, so the
+    caller's entry decision stays fail-closed (SKIP).
 
     ``birdeye_api_key`` defaults to ``config.BIRDEYE_API_KEY`` (read from .env).
     Pass an existing ``client`` to reuse a connection pool (and to inject a mock
@@ -386,7 +680,39 @@ async def get_price_history(
         client = httpx.AsyncClient(timeout=timeout)
 
     try:
-        # --- PRIMARY: Birdeye -------------------------------------------------
+        # --- PRIMARY: GeckoTerminal (free, real candles) ----------------------
+        try:
+            gecko = await _fetch_geckoterminal(
+                client,
+                mint_address,
+                interval=interval,
+                lookback_hours=lookback_hours,
+                min_candles=min_candles,
+                timeout=timeout,
+            )
+            if gecko is not None and len(gecko) >= min_candles:
+                logger.info(
+                    "[price_history] %s -> %d GeckoTerminal candle(s)",
+                    mint_address,
+                    len(gecko),
+                )
+                return gecko
+            if gecko is not None:
+                logger.warning(
+                    "[price_history] %s GeckoTerminal returned %d candle(s) < min %d "
+                    "-> trying next source",
+                    mint_address,
+                    len(gecko),
+                    min_candles,
+                )
+        except Exception as exc:  # noqa: BLE001 — any error (incl. 429) -> next source
+            logger.warning(
+                "[price_history] %s GeckoTerminal failed: %s -> trying next source",
+                mint_address,
+                exc,
+            )
+
+        # --- SECONDARY: Birdeye -----------------------------------------------
         try:
             birdeye = await _fetch_birdeye(
                 client,
@@ -407,19 +733,19 @@ async def get_price_history(
             if birdeye is not None:
                 logger.warning(
                     "[price_history] %s Birdeye returned %d candle(s) < min %d "
-                    "-> trying fallback",
+                    "-> trying next source",
                     mint_address,
                     len(birdeye),
                     min_candles,
                 )
-        except Exception as exc:  # noqa: BLE001 — any error -> fall back
+        except Exception as exc:  # noqa: BLE001 — any error -> next source
             logger.warning(
-                "[price_history] %s Birdeye failed: %s -> trying fallback",
+                "[price_history] %s Birdeye failed: %s -> trying next source",
                 mint_address,
                 exc,
             )
 
-        # --- FALLBACK: Dexscreener -------------------------------------------
+        # --- LAST RESORT: Dexscreener (coarse reconstruction) ----------------
         try:
             fallback = await _fetch_dexscreener(
                 client, mint_address, timeout=timeout, now=now

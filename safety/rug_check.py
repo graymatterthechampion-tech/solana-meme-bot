@@ -72,6 +72,7 @@ DEXSCREENER_BASE: str = "https://api.dexscreener.com/latest/dex"  # no API key
 RATE_LIMIT_MAX_RETRIES: int = 3
 RATE_LIMIT_BACKOFF: float = 0.5   # base seconds; exponential per attempt
 RETRY_AFTER_MAX: float = 10.0     # cap any server-provided Retry-After
+ERROR_BODY_LOG_CHARS: int = 400   # truncate logged 4xx bodies to this length
 
 # Addresses excluded from holder-concentration math: they are not "whales".
 # TODO(addresses): expand with CEX hot wallets (Binance/Coinbase/OKX/Bybit),
@@ -282,6 +283,23 @@ def _helius_rpc_url() -> Optional[str]:
     return None
 
 
+def _error_body(resp: httpx.Response) -> str:
+    """Best-effort truncated response body, for diagnosing a provider rejection.
+
+    Never raises: a body we cannot read must not mask the HTTP error itself.
+    """
+    try:
+        body = resp.text
+    except Exception:  # noqa: BLE001 — undecodable/streamed body
+        return "<unreadable body>"
+    body = " ".join(body.split())  # collapse newlines so it stays one log line
+    if not body:
+        return "<empty body>"
+    if len(body) > ERROR_BODY_LOG_CHARS:
+        return f"{body[:ERROR_BODY_LOG_CHARS]}... (truncated)"
+    return body
+
+
 def _retry_after_seconds(resp: httpx.Response) -> Optional[float]:
     """Parse a Retry-After header (seconds), capped, or None."""
     raw = resp.headers.get("Retry-After")
@@ -307,6 +325,13 @@ async def _request_json(
 
     Honors a server ``Retry-After`` on 429, otherwise exponential backoff.
     Raises on exhaustion; callers fail those checks closed.
+
+    A 4xx is a permanent rejection (bad params, or an endpoint the API plan does
+    not grant), so it is NOT retried — but the provider's explanation lives in
+    the response BODY, which a bare ``raise_for_status`` throws away. We log the
+    truncated body before raising; the raised ``HTTPStatusError`` still carries
+    the full response so callers can branch on it. The URL is never logged: it
+    can embed an ``api-key`` query param (Helius).
     """
     last_error: Optional[Exception] = None
 
@@ -338,6 +363,13 @@ async def _request_json(
             await asyncio.sleep(RATE_LIMIT_BACKOFF * (2 ** attempt))
             continue
 
+        if resp.status_code >= 400:
+            logger.warning(
+                "[rug_check] %s HTTP %d -> %s",
+                label,
+                resp.status_code,
+                _error_body(resp),
+            )
         resp.raise_for_status()
         data: Dict[str, Any] = resp.json()
         return data
