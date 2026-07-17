@@ -30,6 +30,7 @@ from data.price_history import (
     get_price_history,
 )
 from execution.fill_simulator import FillResult, simulate_fill
+from reporting.trade_report import log_trade_report
 from safety.rug_check import (
     SafetyReport,
     evaluate_token_safety,
@@ -130,7 +131,9 @@ def _simulate_sell(
         tokens, market_data.current_price, market_data.current_liquidity
     )
     pnl = fill.net_proceeds_usd - tokens * position.entry_price
-    logger.info(
+    # Per-fill detail is DEBUG: the clean end-of-trade TradeReport summarises
+    # every sell, so this line is only needed when tracing a single fill.
+    logger.debug(
         "[fill] %s tokens=%.6f @ %.8f notional=$%.2f slippage=%.2f%%%s "
         "net=$%.2f pnl=$%.2f",
         label, tokens, market_data.current_price, fill.notional_usd,
@@ -174,7 +177,9 @@ async def process_position(
         position, market_data, dry_run=dry_run
     )
     if exit_decision.should_exit:
-        logger.warning(
+        # Per-tick path detail is DEBUG; the exit and its reason are surfaced
+        # cleanly in the end-of-trade TradeReport (exit_reason).
+        logger.debug(
             "[loop] path=HARD_EXIT trigger=%s reason=%s tokens=%.6f "
             "-> full exit, profit-taking SKIPPED",
             exit_decision.trigger,
@@ -194,7 +199,7 @@ async def process_position(
         position, market_data.current_price, dry_run=dry_run
     )
     if sell_actions:
-        logger.info(
+        logger.debug(
             "[loop] path=PROFIT_TAKING tiers=%s remaining=%.6f",
             [a.tier for a in sell_actions],
             position.remaining,
@@ -207,7 +212,7 @@ async def process_position(
             path="profit_taking", sell_actions=sell_actions, fills=fills
         )
 
-    logger.info(
+    logger.debug(
         "[loop] path=HOLD no hard exit, no profit tier (price=%.8f remaining=%.6f)",
         market_data.current_price,
         position.remaining,
@@ -250,13 +255,13 @@ async def run_loop(
             outcomes.append(None)
         else:
             outcome = await process_position(position, snapshot, dry_run=dry_run)
-            logger.info(
+            logger.debug(
                 "[loop %d/%d] outcome=%s", i + 1, max_iterations, outcome.path
             )
             outcomes.append(outcome)
 
             if outcome.path == "hard_exit":
-                logger.info(
+                logger.debug(
                     "[loop %d/%d] position fully exited -> stopping loop",
                     i + 1,
                     max_iterations,
@@ -429,7 +434,7 @@ async def evaluate_and_trade(
             symbol=symbol,
         )
 
-    logger.info(
+    logger.debug(
         "[trade] %s passed safety gate -> evaluating entry (strategy=%s)",
         mint_address, strategy,
     )
@@ -456,7 +461,7 @@ async def evaluate_and_trade(
     # --- 3. BUY: open the position and manage it in the loop ---------------
     position = decision.position
     assert position is not None  # guaranteed on a BUY decision
-    logger.info(
+    logger.debug(
         "[trade] %s ENTER — opened position size=%.6f @ %.8f (entry_liq=%.2f)",
         mint_address,
         position.original_size,
@@ -471,12 +476,6 @@ async def evaluate_and_trade(
         dry_run=dry_run,
         snapshot_provider=snapshot_provider,
     )
-    pnl = realised_pnl_usd(outcomes, position.entry_price)
-    n_fills = sum(len(o.fills) for o in outcomes if o is not None)
-    logger.info(
-        "[trade] %s managed -> simulated realised PnL = $%.2f over %d fill(s)",
-        mint_address, pnl, n_fills,
-    )
 
     # --- 4. META RANKING (boost only; strictly AFTER the BUY is decided) ----
     # Consumes read-only on-chain signals (buyer breadth + KOL holdings). It can
@@ -484,11 +483,11 @@ async def evaluate_and_trade(
     # fail-closed to a neutral 1.0 and can never veto, block, or shrink a token.
     boost = await meta_boost_provider(mint_address, position.entry_price)
     priority = META_BASE_PRIORITY * boost.boost
-    logger.info(
+    logger.debug(
         "[meta] %s (%s) rank boost=x%.2f priority=%.2f | %s",
         mint_address, symbol, boost.boost, priority, boost.reason,
     )
-    return TradeSession(
+    session = TradeSession(
         mint_address=mint_address,
         status="entered",
         safety_report=report,
@@ -499,6 +498,11 @@ async def evaluate_and_trade(
         meta_boost=boost,
         priority_score=priority,
     )
+    # Emit the one clean, human-readable trade report for this position: entry,
+    # every simulated sell with its PnL, why it exited, and the realised total.
+    # This is the INFO-level signal that replaces the per-tick chatter above.
+    log_trade_report(session)
+    return session
 
 
 async def _default_entry_market_provider(
