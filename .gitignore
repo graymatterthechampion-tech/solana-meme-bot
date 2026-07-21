@@ -8,3 +8,8 @@ __pycache__/
 *.pyc
 venv/
 .venv/
+
+# Trade journal — runtime output (simulated PnL/metrics), not source.
+trades.jsonl
+trades.json
+*.trades.jsonl

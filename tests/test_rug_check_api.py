@@ -314,6 +314,44 @@ def test_rugcheck_timeout_fails_closed() -> None:
     assert report.lp_locked_or_burned is False
 
 
+def test_retry_after_zero_still_backs_off(monkeypatch) -> None:
+    """Regression: a 429 with `Retry-After: 0` must NOT retry instantly.
+
+    GeckoTerminal's free tier answers a 429 with `Retry-After: 0`; taken
+    literally that means "sleep 0s and retry now", a self-inflicted request
+    storm that guarantees more 429s. The client must never wait LESS than its
+    own exponential backoff, so the recorded sleep must equal the backoff, not 0.
+    """
+    slept: List[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr(rug_check.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(rug_check, "RATE_LIMIT_BACKOFF", 0.5)
+
+    seq = [429, 200]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = seq.pop(0)
+        if status == 429:
+            return httpx.Response(429, headers={"Retry-After": "0"}, json={})
+        return httpx.Response(200, json={"ok": True})
+
+    async def _run():
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            return await rug_check._request_json(
+                client, "GET", "https://example.test/x", timeout=1.0, label="gecko",
+            )
+        finally:
+            await client.aclose()
+
+    data = asyncio.run(_run())
+    assert data == {"ok": True}                 # succeeded on the retry
+    assert slept == [pytest.approx(0.5)]        # backed off 0.5s, not 0.0s
+
+
 def test_helius_fallback_used_when_rugcheck_omits_topholders() -> None:
     # RugCheck report has no topHolders -> holders come from Helius fallback.
     report = evaluate(

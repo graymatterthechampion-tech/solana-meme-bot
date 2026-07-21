@@ -15,7 +15,12 @@ import httpx
 import pytest
 
 import config
-from data.market_feed import ROLLING_WINDOW, get_live_market_snapshot
+from data.market_feed import (
+    FINE_1M_OHLCV_SOURCES,
+    ROLLING_WINDOW,
+    get_live_market_snapshot,
+)
+from data.price_history import Candle, OHLCVHistory
 from safety import rug_check
 
 NOW = 1_700_000_000.0
@@ -132,3 +137,67 @@ def test_no_birdeye_key_fails_closed(monkeypatch) -> None:
     items = [candle((18 - i) * 60.0, close=1.0, vol=5.0) for i in range(18)]
     snap = fetch(make_handler(birdeye_json=birdeye_payload(items)), api_key=None)
     assert snap is None
+
+
+# --- 1m OHLCV source acceptance ---------------------------------------------
+# Regression: the live feed must accept ANY true 1m source (GeckoTerminal is the
+# current primary), not just Birdeye. A stale `source == "birdeye"` guard threw
+# away real GeckoTerminal candles and fail-closed every snapshot, so an entered
+# position could never be managed.
+
+def _history(source: str, *, n: int = 18) -> OHLCVHistory:
+    """A valid n-candle 1m history from ``source``; last candle 1.0 -> 1.2."""
+    candles = [
+        Candle(
+            timestamp=NOW - (n - i) * 60.0,
+            open=1.0, high=1.2, low=1.0,
+            close=1.0 if i < n - 1 else 1.2,
+            volume=5.0,
+        )
+        for i in range(n)
+    ]
+    return OHLCVHistory("MINT", 1.0, source, candles)
+
+
+def _fetch_with_history(history: Optional[OHLCVHistory]):
+    """Drive get_live_market_snapshot with an injected history source.
+
+    Dexscreener liquidity is still mocked (the feed always needs it); only the
+    OHLCV history is swapped so we test the source-acceptance guard directly.
+    """
+    async def fake_fetch(_token: str, **_kwargs: Any) -> Optional[OHLCVHistory]:
+        return history
+
+    async def _run():
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(make_handler(dex_json=dex_payload()))
+        )
+        try:
+            return await get_live_market_snapshot(
+                "MINT", 60_000.0, client=client,
+                history_fetcher=fake_fetch, now=NOW,
+            )
+        finally:
+            await client.aclose()
+
+    return asyncio.run(_run())
+
+
+def test_geckoterminal_1m_history_is_accepted() -> None:
+    snap = _fetch_with_history(_history("geckoterminal"))
+    assert snap is not None                       # previously fail-closed
+    assert snap.current_price == pytest.approx(1.2)
+    assert snap.candle_1m_open == pytest.approx(1.0)
+    assert snap.candle_1m_close == pytest.approx(1.2)
+
+
+def test_coarse_dexscreener_history_fails_closed() -> None:
+    # The coarse Dexscreener OHLCV fallback can't yield a real 1m candle, so a
+    # snapshot must NOT be built from it (it would disarm flash-crash/vol checks).
+    assert _fetch_with_history(_history("dexscreener")) is None
+
+
+def test_fine_1m_sources_membership() -> None:
+    assert "geckoterminal" in FINE_1M_OHLCV_SOURCES
+    assert "birdeye" in FINE_1M_OHLCV_SOURCES
+    assert "dexscreener" not in FINE_1M_OHLCV_SOURCES

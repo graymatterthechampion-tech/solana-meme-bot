@@ -63,6 +63,14 @@ LIVE_INTERVAL: str = "1m"          # candle width for the management loop
 LIVE_LOOKBACK_HOURS: float = 2.0   # enough 1m candles to find a 15m volume peak
 ROLLING_WINDOW: int = 15           # candles per rolling window (15 x 1m = 15m)
 
+# OHLCV sources that deliver TRUE 1m candles (real per-minute open/close and a
+# genuine 15m volume). The management loop's flash-crash and volume-collapse
+# triggers are only meaningful on these. GeckoTerminal is the current primary;
+# Birdeye is the paid secondary. The coarse Dexscreener fallback (source
+# "dexscreener") is deliberately excluded: it cannot yield a real 1m candle, so
+# a snapshot built from it would silently disarm those triggers.
+FINE_1M_OHLCV_SOURCES: frozenset = frozenset({"geckoterminal", "birdeye"})
+
 # Async OHLCV source: mint -> recent history (injectable for tests).
 HistoryFetcher = Callable[..., Awaitable[Optional[OHLCVHistory]]]
 
@@ -316,12 +324,15 @@ async def get_live_market_snapshot(
             now=now,
         )
         # Need real 1m candles: the coarse Dexscreener fallback can't yield a
-        # 1m candle or a true 15m volume, so anything but Birdeye fails closed.
-        if (history is None or history.source != "birdeye"
+        # 1m candle or a true 15m volume, so any source outside
+        # FINE_1M_OHLCV_SOURCES (i.e. the Dexscreener fallback) fails closed.
+        if (history is None or history.source not in FINE_1M_OHLCV_SOURCES
                 or len(history) < ROLLING_WINDOW):
             logger.warning(
-                "[feed] %s no usable 1m candle history -> fail-closed (None)",
+                "[feed] %s no usable 1m candle history (source=%s) -> "
+                "fail-closed (None)",
                 token_address,
+                None if history is None else history.source,
             )
             return None
 

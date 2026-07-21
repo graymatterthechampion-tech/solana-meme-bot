@@ -346,9 +346,14 @@ async def _request_json(
             continue
 
         if resp.status_code == 429:
-            delay = _retry_after_seconds(resp)
-            if delay is None:
-                delay = RATE_LIMIT_BACKOFF * (2 ** attempt)
+            # Never retry FASTER than our own exponential backoff. Some providers
+            # (GeckoTerminal free tier) answer a 429 with `Retry-After: 0`, which
+            # parsed literally means "sleep 0s and retry now" — a self-inflicted
+            # request storm that guarantees more 429s. Honor a server value only
+            # when it asks us to wait LONGER than we already would.
+            backoff = RATE_LIMIT_BACKOFF * (2 ** attempt)
+            server_delay = _retry_after_seconds(resp)
+            delay = backoff if server_delay is None else max(server_delay, backoff)
             logger.warning("[rug_check] %s rate-limited (429); retry in %.2fs", label, delay)
             last_error = httpx.HTTPStatusError(
                 "429 Too Many Requests", request=resp.request, response=resp

@@ -61,3 +61,12 @@ HELIUS_API_KEY: Optional[str] = _get("HELIUS_API_KEY")
 KOL_WALLETS: list[str] = [
     w.strip() for w in (_get("KOL_WALLETS", "") or "").split(",") if w.strip()
 ]
+
+# --- Trade journal -----------------------------------------------------------
+# Append-only local file where each completed (dry-run) trade is journalled so
+# performance can be analysed across runs (see reporting.trade_journal /
+# reporting.journal_summary). It holds only simulated PnL and market metrics —
+# never keys or secrets — so it is safe on disk, but it is runtime output and is
+# git-ignored. JSON Lines (one JSON object per line) so appends never rewrite
+# the file. Override the location with the TRADE_JOURNAL_PATH env var.
+TRADE_JOURNAL_PATH: str = _get("TRADE_JOURNAL_PATH", "trades.jsonl") or "trades.jsonl"

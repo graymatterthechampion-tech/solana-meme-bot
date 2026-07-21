@@ -20,6 +20,7 @@ import logging
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
 
 import config
@@ -30,6 +31,8 @@ from data.price_history import (
     get_price_history,
 )
 from execution.fill_simulator import FillResult, simulate_fill
+from reporting.journal_summary import build_summary, format_summary
+from reporting.trade_journal import append_trade
 from reporting.trade_report import log_trade_report
 from safety.rug_check import (
     SafetyReport,
@@ -401,6 +404,7 @@ async def evaluate_and_trade(
     safety_checker: SafetyChecker = _default_safety_checker,
     snapshot_provider: SnapshotProvider = mock_market_snapshot,
     meta_boost_provider: MetaBoostProvider = _neutral_meta_boost_provider,
+    journal_path: Optional[str] = None,
 ) -> TradeSession:
     """Run the full candidate pipeline: safety gate -> entry -> manage loop.
 
@@ -468,6 +472,7 @@ async def evaluate_and_trade(
         position.entry_price,
         decision.entry_liquidity,
     )
+    entry_time = datetime.now(timezone.utc).isoformat()
     outcomes = await run_loop(
         position,
         token_address=mint_address,
@@ -476,6 +481,7 @@ async def evaluate_and_trade(
         dry_run=dry_run,
         snapshot_provider=snapshot_provider,
     )
+    exit_time = datetime.now(timezone.utc).isoformat()
 
     # --- 4. META RANKING (boost only; strictly AFTER the BUY is decided) ----
     # Consumes read-only on-chain signals (buyer breadth + KOL holdings). It can
@@ -501,7 +507,21 @@ async def evaluate_and_trade(
     # Emit the one clean, human-readable trade report for this position: entry,
     # every simulated sell with its PnL, why it exited, and the realised total.
     # This is the INFO-level signal that replaces the per-tick chatter above.
-    log_trade_report(session)
+    report = log_trade_report(session)
+
+    # Durably journal the completed trade (best-effort, append-only) so it can
+    # be analysed after the run and across runs. Only ever writes a local file;
+    # nothing is signed or broadcast. Disabled unless a journal path is given
+    # (library/test callers pass None and stay hermetic).
+    if report is not None and journal_path:
+        append_trade(
+            report,
+            journal_path,
+            dry_run=dry_run,
+            entry_time=entry_time,
+            exit_time=exit_time,
+            hold_ticks=len(outcomes),
+        )
     return session
 
 
@@ -553,6 +573,7 @@ async def scan_and_evaluate(
     entry_market_provider: EntryMarketProvider = _default_entry_market_provider,
     snapshot_provider: SnapshotProvider = mock_market_snapshot,
     meta_boost_provider: MetaBoostProvider = _neutral_meta_boost_provider,
+    journal_path: Optional[str] = None,
 ) -> List[TradeSession]:
     """Discover live candidates and run each through the full pipeline.
 
@@ -619,6 +640,7 @@ async def scan_and_evaluate(
             safety_checker=safety_checker,
             snapshot_provider=snapshot_provider,
             meta_boost_provider=meta_boost_provider,
+            journal_path=journal_path,
         )
         logger.info(
             "[scan %d/%d] %s (%s) -> %s",
@@ -700,6 +722,17 @@ def _log_cumulative_summary(stats: CumulativeStats) -> None:
     )
 
 
+def _print_journal_summary(journal_path: str) -> None:
+    """Print the persisted-journal performance summary at end of a run.
+
+    Read-only: reads the append-only journal and renders the ASCII table. Safe
+    no-op (prints an empty-journal notice) if nothing was recorded this run.
+    """
+    summary, count = build_summary(journal_path)
+    print()
+    print(format_summary(summary, source=f"{journal_path} ({count} trade(s))"))
+
+
 async def run_continuous(
     *,
     interval: float = DEFAULT_INTERVAL_SECONDS,
@@ -713,6 +746,7 @@ async def run_continuous(
     sleep: AsyncSleep = asyncio.sleep,
     max_cycles: Optional[int] = None,
     stats: Optional[CumulativeStats] = None,
+    journal_path: Optional[str] = None,
 ) -> CumulativeStats:
     """Re-run ``scan_and_evaluate`` every ``interval`` seconds until interrupted.
 
@@ -746,7 +780,7 @@ async def run_continuous(
                 dry_run,
                 interval,
             )
-            sessions = await scan(
+            scan_kwargs: Dict[str, Any] = dict(
                 max_candidates=max_candidates,
                 max_iterations=max_iterations,
                 dry_run=dry_run,
@@ -754,6 +788,11 @@ async def run_continuous(
                 snapshot_provider=snapshot_provider,
                 meta_boost_provider=meta_boost_provider,
             )
+            # Only forward the journal path when journalling is enabled, so the
+            # hermetic default (None) leaves the scan call signature unchanged.
+            if journal_path:
+                scan_kwargs["journal_path"] = journal_path
+            sessions = await scan(**scan_kwargs)
             stats.record_cycle(sessions)
             logger.info(
                 "[loop] cycle %d done: %d candidate(s) %s | "
@@ -927,6 +966,7 @@ def main() -> None:
                     snapshot_provider=get_live_market_snapshot,
                     meta_boost_provider=_live_meta_boost_provider,
                     stats=stats,
+                    journal_path=config.TRADE_JOURNAL_PATH,
                 )
             )
         except KeyboardInterrupt:
@@ -934,6 +974,7 @@ def main() -> None:
             # coroutine; either way the in-place stats are intact.
             logger.info("[loop] keyboard interrupt received — shutting down")
         _log_cumulative_summary(stats)
+        _print_journal_summary(config.TRADE_JOURNAL_PATH)
         return
 
     # Single pass: live, read-only discovery -> per-candidate dry-run evaluation.
@@ -952,6 +993,7 @@ def main() -> None:
             strategy=args.strategy,
             snapshot_provider=get_live_market_snapshot,
             meta_boost_provider=_live_meta_boost_provider,
+            journal_path=config.TRADE_JOURNAL_PATH,
         )
     )
     summary = Counter(s.status for s in sessions)
@@ -960,6 +1002,7 @@ def main() -> None:
         len(sessions),
         dict(summary),
     )
+    _print_journal_summary(config.TRADE_JOURNAL_PATH)
 
 
 if __name__ == "__main__":
