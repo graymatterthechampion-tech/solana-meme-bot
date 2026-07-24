@@ -9,7 +9,8 @@ __pycache__/
 venv/
 .venv/
 
-# Trade journal — runtime output (simulated PnL/metrics), not source.
+# Trade journal + generated report — runtime output, not source.
 trades.jsonl
 trades.json
 *.trades.jsonl
+report.html
