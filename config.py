@@ -32,6 +32,28 @@ def _require(name: str) -> str:
     return value
 
 
+def _get_float(name: str, default: float) -> float:
+    """Read a float env var, falling back to ``default`` on unset/invalid."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _get_int(name: str, default: int) -> int:
+    """Read an int env var, falling back to ``default`` on unset/invalid."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 # --- Network -----------------------------------------------------------------
 # One of: "devnet" | "mainnet-beta". Defaults to the safe network.
 SOLANA_NETWORK: str = _get("SOLANA_NETWORK", "devnet") or "devnet"
@@ -70,3 +92,18 @@ KOL_WALLETS: list[str] = [
 # git-ignored. JSON Lines (one JSON object per line) so appends never rewrite
 # the file. Override the location with the TRADE_JOURNAL_PATH env var.
 TRADE_JOURNAL_PATH: str = _get("TRADE_JOURNAL_PATH", "trades.jsonl") or "trades.jsonl"
+
+# --- Re-entry guard (churn protection) ---------------------------------------
+# Prevents the bot from re-buying the same mint over and over (the observed
+# ACM x7 churn). See safety.reentry.ReentryGuard. All read-only / dry-run safe.
+#
+#   COOLDOWN     : after ENTERING a mint, refuse to re-enter it for this many
+#                  seconds regardless of outcome (default 1h). Stops rapid churn.
+#   BLACKLIST_HARD_EXITS : after this many defensive hard-exits on a mint, it is
+#                  blacklisted (a hard exit means it flash-crashed / rugged /
+#                  volume-collapsed — a clear "avoid" signal). Default 1.
+#   BLACKLIST_SECONDS    : how long a blacklist lasts (default 24h). Set to 0 (or
+#                  negative) to blacklist for the whole process (permanent).
+REENTRY_COOLDOWN_SECONDS: float = _get_float("REENTRY_COOLDOWN_SECONDS", 3600.0)
+REENTRY_BLACKLIST_HARD_EXITS: int = _get_int("REENTRY_BLACKLIST_HARD_EXITS", 1)
+REENTRY_BLACKLIST_SECONDS: float = _get_float("REENTRY_BLACKLIST_SECONDS", 86_400.0)

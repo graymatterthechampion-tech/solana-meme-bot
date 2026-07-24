@@ -32,8 +32,9 @@ from data.price_history import (
 )
 from execution.fill_simulator import FillResult, simulate_fill
 from reporting.journal_summary import build_summary, format_summary
-from reporting.trade_journal import append_trade
+from reporting.trade_journal import append_trade, load_records
 from reporting.trade_report import log_trade_report
+from safety.reentry import ReentryGuard
 from safety.rug_check import (
     SafetyReport,
     evaluate_token_safety,
@@ -284,6 +285,8 @@ class TradeSession:
     ``status`` is one of:
         "no_market_data"  no per-candidate market data could be built (fail-
                           closed); safety/entry never evaluated
+        "reentry_blocked" the re-entry guard skipped this mint (cooldown or
+                          blacklist); safety/entry never evaluated
         "rejected_safety" safety gate failed; entry never evaluated
         "no_entry"        safety passed but entry was WAIT/SKIP; no position
         "entered"         safety + BUY; a position was opened and the loop ran
@@ -574,6 +577,7 @@ async def scan_and_evaluate(
     snapshot_provider: SnapshotProvider = mock_market_snapshot,
     meta_boost_provider: MetaBoostProvider = _neutral_meta_boost_provider,
     journal_path: Optional[str] = None,
+    reentry_guard: Optional[ReentryGuard] = None,
 ) -> List[TradeSession]:
     """Discover live candidates and run each through the full pipeline.
 
@@ -616,6 +620,20 @@ async def scan_and_evaluate(
             )
             continue
 
+        # Re-entry guard (runs BEFORE any network fetch / safety / entry work):
+        # skip mints we recently traded (cooldown) or that burned us (blacklist).
+        if reentry_guard is not None:
+            skip_reason = reentry_guard.check(mint, datetime.now(timezone.utc))
+            if skip_reason is not None:
+                logger.info(
+                    "[scan %d/%d] %s (%s) -> SKIP re-entry: %s",
+                    idx, len(selected), symbol, mint, skip_reason,
+                )
+                sessions.append(
+                    TradeSession(mint_address=mint, status="reentry_blocked", symbol=symbol)
+                )
+                continue
+
         entry_market = await entry_market_provider(candidate)
         if entry_market is None:
             logger.warning(
@@ -642,6 +660,18 @@ async def scan_and_evaluate(
             meta_boost_provider=meta_boost_provider,
             journal_path=journal_path,
         )
+        # Feed the guard: an entry arms the cooldown; any hard exit this trade
+        # took counts toward the blacklist. Only "entered" sessions opened a
+        # position, so nothing else can move the guard's state.
+        if reentry_guard is not None and session.status == "entered":
+            now = datetime.now(timezone.utc)
+            reentry_guard.record_entry(mint, now)
+            for outcome in session.loop_outcomes:
+                if (outcome is not None and outcome.path == "hard_exit"
+                        and outcome.exit_decision is not None):
+                    reentry_guard.record_hard_exit(
+                        mint, outcome.exit_decision.trigger, now
+                    )
         logger.info(
             "[scan %d/%d] %s (%s) -> %s",
             idx,
@@ -747,6 +777,7 @@ async def run_continuous(
     max_cycles: Optional[int] = None,
     stats: Optional[CumulativeStats] = None,
     journal_path: Optional[str] = None,
+    reentry_guard: Optional[ReentryGuard] = None,
 ) -> CumulativeStats:
     """Re-run ``scan_and_evaluate`` every ``interval`` seconds until interrupted.
 
@@ -792,6 +823,10 @@ async def run_continuous(
             # hermetic default (None) leaves the scan call signature unchanged.
             if journal_path:
                 scan_kwargs["journal_path"] = journal_path
+            # Pass the SAME guard object every cycle so cooldown/blacklist state
+            # accumulates across the run (not just within one scan).
+            if reentry_guard is not None:
+                scan_kwargs["reentry_guard"] = reentry_guard
             sessions = await scan(**scan_kwargs)
             stats.record_cycle(sessions)
             logger.info(
@@ -946,6 +981,25 @@ def main() -> None:
     if not args.dry_run:
         logger.info("[startup] LIVE mode requested — trading logic not implemented yet.")
 
+    # Re-entry guard, seeded from the persisted journal so cooldown/blacklist
+    # survive across separate runs (the observed ACM churn was 7 separate
+    # processes). Read-only: it only ever SKIPS a re-buy.
+    now0 = datetime.now(timezone.utc)
+    reentry_guard = ReentryGuard.from_records(
+        load_records(config.TRADE_JOURNAL_PATH),
+        now=now0,
+        cooldown_seconds=config.REENTRY_COOLDOWN_SECONDS,
+        blacklist_hard_exits=config.REENTRY_BLACKLIST_HARD_EXITS,
+        blacklist_seconds=config.REENTRY_BLACKLIST_SECONDS,
+    )
+    logger.info(
+        "[startup] re-entry guard: cooldown=%.0fs blacklist>=%d hard-exit(s) for %.0fs "
+        "| seeded %d mint(s), %d currently blacklisted",
+        config.REENTRY_COOLDOWN_SECONDS, config.REENTRY_BLACKLIST_HARD_EXITS,
+        config.REENTRY_BLACKLIST_SECONDS, reentry_guard.tracked,
+        len(reentry_guard.blacklisted_mints(now0)),
+    )
+
     # Continuous mode: keep re-scanning every --interval seconds until Ctrl+C.
     # Stats are accumulated in a local object so the cumulative summary is still
     # reported if the run is interrupted mid-cycle. Read-only/dry-run throughout.
@@ -967,6 +1021,7 @@ def main() -> None:
                     meta_boost_provider=_live_meta_boost_provider,
                     stats=stats,
                     journal_path=config.TRADE_JOURNAL_PATH,
+                    reentry_guard=reentry_guard,
                 )
             )
         except KeyboardInterrupt:
@@ -994,6 +1049,7 @@ def main() -> None:
             snapshot_provider=get_live_market_snapshot,
             meta_boost_provider=_live_meta_boost_provider,
             journal_path=config.TRADE_JOURNAL_PATH,
+            reentry_guard=reentry_guard,
         )
     )
     summary = Counter(s.status for s in sessions)
