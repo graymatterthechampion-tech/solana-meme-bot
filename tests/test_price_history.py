@@ -47,18 +47,20 @@ def run(coro):
 # --- Birdeye fixtures --------------------------------------------------------
 
 def proven_runner_items() -> List[Dict[str, Any]]:
-    """OHLCV items for a proven runner: ATH 5h ago (10x volume spike), now in a
-    stabilised ~40% dip. Drives evaluate_entry to BUY."""
+    """OHLCV items for a HEALTHY proven-runner dip: ATH 5h ago (6x volume spike),
+    now a stabilised ~40% dip with volume RETURNING (100 -> 200 -> 300) as buyers
+    step back in. Live volume, not a pump-and-fade, so it clears both the
+    proven-runner gate and the volume-freshness gate -> evaluate_entry BUYs."""
     return [
         # (seconds_ago, open, high, low, close, volume)
         _item(6 * HOUR, 0.50, 0.50, 0.48, 0.50, 100.0),
-        _item(5 * HOUR, 0.90, 1.00, 0.90, 1.00, 1000.0),   # ATH + volume spike
+        _item(5 * HOUR, 0.90, 1.00, 0.90, 1.00, 1200.0),   # ATH + volume spike
         _item(4 * HOUR, 0.85, 0.86, 0.78, 0.80, 100.0),
         _item(3 * HOUR, 0.75, 0.76, 0.69, 0.70, 100.0),
-        _item(2 * HOUR, 0.66, 0.66, 0.60, 0.62, 100.0),
-        _item(600.0, 0.61, 0.61, 0.59, 0.60, 100.0),
-        _item(300.0, 0.60, 0.61, 0.60, 0.605, 100.0),
-        _item(0.0, 0.605, 0.605, 0.60, 0.60, 100.0),
+        _item(2 * HOUR, 0.66, 0.66, 0.60, 0.62, 200.0),
+        _item(600.0, 0.61, 0.61, 0.59, 0.60, 300.0),       # accumulation returning
+        _item(300.0, 0.60, 0.61, 0.60, 0.605, 300.0),
+        _item(0.0, 0.605, 0.605, 0.60, 0.60, 300.0),
     ]
 
 
@@ -287,7 +289,33 @@ def test_birdeye_full_history_enables_entry_evaluation() -> None:
     assert decision.action is EntryAction.BUY
     assert decision.proven_runner is True
     assert decision.pullback_pct == pytest.approx(0.40, abs=0.01)
-    assert decision.volume_spike_ratio == pytest.approx(10.0, abs=0.1)
+    assert decision.volume_spike_ratio == pytest.approx(6.0, abs=0.1)  # 1200 / 200 baseline
+
+
+def test_build_entry_market_data_disables_drain_without_pre_dip() -> None:
+    """Fix #3: no pre-dip liquidity supplied -> pre_dip = 0.0 (drain check off).
+
+    The old default copied current_liquidity into pre_dip, which made the drain
+    check silently pass as false comfort. It must now be an explicit 'unknown'.
+    """
+    with_history = build_entry_market_data(
+        current_price=0.60, current_liquidity=50_000.0,
+        market_cap_usd=None, history=fetch(make_handler()), now=NOW,
+    )
+    assert with_history.pre_dip_liquidity == 0.0
+
+    no_history = build_entry_market_data(
+        current_price=0.60, current_liquidity=50_000.0,
+        market_cap_usd=None, history=None,
+    )
+    assert no_history.pre_dip_liquidity == 0.0
+
+    # An explicit figure is still honoured (drain check re-armed).
+    supplied = build_entry_market_data(
+        current_price=0.60, current_liquidity=50_000.0, market_cap_usd=None,
+        history=None, pre_dip_liquidity=70_000.0,
+    )
+    assert supplied.pre_dip_liquidity == 70_000.0
 
 
 def test_birdeye_failure_falls_back_to_dexscreener() -> None:
@@ -472,7 +500,7 @@ def test_geckoterminal_full_history_is_primary_and_enables_entry() -> None:
     assert decision.action is EntryAction.BUY
     assert decision.proven_runner is True
     assert decision.pullback_pct == pytest.approx(0.40, abs=0.01)
-    assert decision.volume_spike_ratio == pytest.approx(10.0, abs=0.1)
+    assert decision.volume_spike_ratio == pytest.approx(6.0, abs=0.1)  # 1200 / 200 baseline
 
 
 def test_geckoterminal_picks_deepest_liquidity_pool() -> None:

@@ -16,6 +16,11 @@ DECISION PIPELINE (every gate fail-closed; a buy is the one irreversible act)
 2. PROVEN RUNNER gate ............ must pass to be considered:
      * new ATH within ``ath_max_age_hours`` (default 12h), else stale -> SKIP
      * volume spike >= ``min_volume_spike``x baseline (default 5x), else SKIP
+2b. VOLUME FRESHNESS gate ........ trailing 15m volume must still be >=
+     ``min_volume_freshness`` of the window peak (default 40%). The proven-runner
+     gate only proves it ONCE spiked; this proves volume is still ALIVE. The exit
+     hard-dumps below 30% of peak, so buying a faded token means an instant
+     volume_collapse exit                                       -> SKIP
 3. PULLBACK trigger .............. retrace off ATH:
      * younger than ``ath_min_age_hours`` (default 2h)          -> WAIT (hot)
      * retrace < ``pullback_min_pct`` (default 30%)             -> WAIT (early)
@@ -23,8 +28,12 @@ DECISION PIPELINE (every gate fail-closed; a buy is the one irreversible act)
 4. CONSOLIDATION check ........... price must have stabilised within a tight
      band (default 10%) over the last K minutes (default 5); still dropping
      vertically (a falling knife)                               -> WAIT
+4b. VOLUME-BACKED consolidation .. that tight band must have real trading behind
+     it (recent volume >= ``consolidation_min_volume_ratio`` of baseline, default
+     30%); a flat price with no volume is a flatline (death), not a dip -> WAIT
 5. LIQUIDITY check ............... current liquidity must clear the floor AND
-     not be significantly drained vs its pre-dip level          -> SKIP
+     (only when a real pre-dip liquidity is supplied) not be significantly
+     drained vs that pre-dip level                              -> SKIP
 6. SIZING -> BUY ................. 1% (configurable) of portfolio balance,
      additionally capped at a fraction of pool liquidity (MEV guard).
 
@@ -64,6 +73,23 @@ PULLBACK_MAX_PCT: float = 0.50      # above this retrace: breakdown (SKIP)
 # --- Consolidation / falling-knife guard (tunable) --------------------------
 CONSOLIDATION_BAND_PCT: float = 0.10   # max range over the window to be "tight"
 CONSOLIDATION_MINUTES: float = 5.0     # window that must be tight (minutes)
+# A tight price band with almost no trading is a FLATLINE (the token died), not
+# a stabilised dip — price only holds still because nobody is trading. Require
+# the consolidation window's volume to be at least this fraction of the baseline
+# so "flat because accumulating" is distinguished from "flat because dead".
+CONSOLIDATION_MIN_VOLUME_RATIO: float = 0.30
+
+# --- Volume-freshness gate (tunable) — consistency with the EXIT ------------
+# The proven-runner gate only proves the token ONCE spiked (peak volume); it says
+# nothing about whether volume still exists now. The management loop HARD-EXITS
+# (volume_collapse) when trailing 15m volume falls below 30% of its peak, so a
+# pumped-then-faded token is simultaneously a "proven runner" (entry) and a
+# "volume collapse" (exit) — we buy it and dump it the same tick. This gate
+# closes that contradiction: refuse to BUY unless current trailing-window volume
+# is still at least MIN_VOLUME_FRESHNESS of the window peak. The floor sits ABOVE
+# the exit's 0.30 so we never buy right at the dump edge.
+VOLUME_FRESHNESS_WINDOW_MINUTES: float = 15.0   # trailing window (matches exit)
+MIN_VOLUME_FRESHNESS: float = 0.40              # rolling/peak floor to BUY
 
 # --- Liquidity (tunable) ----------------------------------------------------
 MIN_LIQUIDITY_USD: float = 10_000.0    # absolute pool-liquidity floor
@@ -128,6 +154,7 @@ class EntryDecision:
     ath_age_hours: float = 0.0
     pullback_pct: float = 0.0
     volume_spike_ratio: float = 0.0
+    volume_freshness: float = 0.0
     consolidated: bool = False
     position: Optional[Position] = None
     entry_price: float = 0.0
@@ -149,6 +176,56 @@ def _baseline_average(volume_history: List[float]) -> Optional[float]:
         return None
     avg = sum(rest) / len(rest)
     return avg if avg > 0 else None
+
+
+def _rolling_and_peak_volume(
+    volume_history: List[float],
+    sample_interval_minutes: float,
+    window_minutes: float,
+) -> Optional[tuple]:
+    """Return ``(trailing_window_volume, peak_window_volume)`` or ``None``.
+
+    Sums volume over a trailing window of ``window_minutes`` and finds the
+    largest same-width window anywhere in the series (the peak the freshness
+    check compares against). This is the SAME computation the live feed uses to
+    derive the exit's 15m volume (:func:`data.market_feed._derive_volume_metrics`),
+    so entry-freshness and exit-collapse are measured on one identical yardstick.
+    Returns ``None`` if there is no volume history at all.
+    """
+    interval = sample_interval_minutes if sample_interval_minutes > 0 else 1.0
+    w = max(1, round(window_minutes / interval))
+    vols = volume_history
+    n = len(vols)
+    if n == 0:
+        return None
+
+    rolling = sum(vols[-w:])
+    if n >= w:
+        window_sum = sum(vols[:w])
+        peak = window_sum
+        for i in range(w, n):
+            window_sum += vols[i] - vols[i - w]
+            peak = max(peak, window_sum)
+    else:
+        # Fewer than one full window: the whole series IS the only window, so the
+        # peak equals the current rolling sum (freshness is then 1.0 — we cannot
+        # yet judge a fade, so this gate stays inert until a full window exists).
+        peak = rolling
+    return rolling, peak
+
+
+def _recent_average_volume(
+    volume_history: List[float],
+    sample_interval_minutes: float,
+    window_minutes: float,
+) -> Optional[float]:
+    """Mean per-sample volume over the most recent ``window_minutes``, or None."""
+    interval = sample_interval_minutes if sample_interval_minutes > 0 else 1.0
+    n = max(1, round(window_minutes / interval))
+    window = volume_history[-n:]
+    if not window:
+        return None
+    return sum(window) / len(window)
 
 
 def _is_consolidated(
@@ -218,8 +295,11 @@ async def evaluate_entry(
     min_volume_spike: float = MIN_VOLUME_SPIKE,
     pullback_min_pct: float = PULLBACK_MIN_PCT,
     pullback_max_pct: float = PULLBACK_MAX_PCT,
+    min_volume_freshness: float = MIN_VOLUME_FRESHNESS,
+    volume_freshness_window_minutes: float = VOLUME_FRESHNESS_WINDOW_MINUTES,
     consolidation_band_pct: float = CONSOLIDATION_BAND_PCT,
     consolidation_minutes: float = CONSOLIDATION_MINUTES,
+    consolidation_min_volume_ratio: float = CONSOLIDATION_MIN_VOLUME_RATIO,
     portfolio_balance: float = DEFAULT_PORTFOLIO_USD,
     portfolio_allocation_pct: float = PORTFOLIO_ALLOCATION_PCT,
     time_stop_minutes: float = DEFAULT_TIME_STOP_MINUTES,
@@ -293,7 +373,30 @@ async def evaluate_entry(
                 ath_age_hours=ath_age_hours, volume_spike_ratio=volume_spike_ratio,
             )
 
-        # Proven runner from here on.
+        # --- 2b. VOLUME FRESHNESS (still alive; consistent with the exit) --
+        # A proven runner whose volume has since DIED would enter and then be
+        # hard-exited on volume_collapse the very next tick. Refuse it here.
+        rolling_peak = _rolling_and_peak_volume(
+            market.volume_history, market.sample_interval_minutes,
+            volume_freshness_window_minutes,
+        )
+        volume_freshness = 1.0
+        if rolling_peak is not None:
+            rolling_v, peak_v = rolling_peak
+            volume_freshness = (rolling_v / peak_v) if peak_v > 0 else 0.0
+            if volume_freshness < min_volume_freshness:
+                return _decision(
+                    EntryAction.SKIP, mint_address,
+                    f"volume faded: trailing {volume_freshness_window_minutes:.0f}m "
+                    f"volume is {volume_freshness * 100:.1f}% of peak "
+                    f"(< {min_volume_freshness * 100:.0f}%); pumped-then-dead, "
+                    f"would hard-exit on volume_collapse",
+                    proven_runner=True, ath_age_hours=ath_age_hours,
+                    volume_spike_ratio=volume_spike_ratio,
+                    volume_freshness=volume_freshness,
+                )
+
+        # Proven runner with live volume from here on.
         pullback_pct = (ath_price - market.current_price) / ath_price
 
         # --- 3. PULLBACK trigger --------------------------------------------
@@ -335,7 +438,28 @@ async def evaluate_entry(
                 f"{consolidation_minutes:.0f}min (falling knife)",
                 proven_runner=True, ath_age_hours=ath_age_hours,
                 pullback_pct=pullback_pct, volume_spike_ratio=volume_spike_ratio,
-                consolidated=False,
+                volume_freshness=volume_freshness, consolidated=False,
+            )
+
+        # --- 4b. Consolidation must be VOLUME-BACKED (flat != dead) ---------
+        # A tight band with no trades is a flatline (nobody left to move price),
+        # not accumulation. Require recent volume above a fraction of baseline so
+        # death does not masquerade as a stabilised dip.
+        recent_volume = _recent_average_volume(
+            market.volume_history, market.sample_interval_minutes,
+            consolidation_minutes,
+        )
+        if (recent_volume is not None and avg_volume > 0
+                and recent_volume < consolidation_min_volume_ratio * avg_volume):
+            return _decision(
+                EntryAction.WAIT, mint_address,
+                f"price flat but volume dead: recent {consolidation_minutes:.0f}m "
+                f"avg volume {recent_volume:.0f} < "
+                f"{consolidation_min_volume_ratio * 100:.0f}% of baseline "
+                f"{avg_volume:.0f} (flatline, not stabilising)",
+                proven_runner=True, ath_age_hours=ath_age_hours,
+                pullback_pct=pullback_pct, volume_spike_ratio=volume_spike_ratio,
+                volume_freshness=volume_freshness, consolidated=True,
             )
 
         # --- 5. LIQUIDITY check (floor + drain vs pre-dip) ------------------
@@ -348,6 +472,11 @@ async def evaluate_entry(
                 pullback_pct=pullback_pct, volume_spike_ratio=volume_spike_ratio,
                 consolidated=True,
             )
+        # Drain check runs ONLY with a genuine pre-dip liquidity figure. The live
+        # pipeline has no historical-liquidity source, so it passes 0.0 here
+        # (disabled) rather than defaulting pre-dip to the current value, which
+        # would make the check silently pass as false comfort. See
+        # data.price_history.build_entry_market_data.
         if market.pre_dip_liquidity > 0:
             drained = 1.0 - market.current_liquidity / market.pre_dip_liquidity
             if drained > MAX_LIQUIDITY_DRAIN_PCT:
@@ -387,6 +516,7 @@ async def evaluate_entry(
             ath_age_hours=ath_age_hours,
             pullback_pct=pullback_pct,
             volume_spike_ratio=volume_spike_ratio,
+            volume_freshness=volume_freshness,
             consolidated=True,
             position=position,
             entry_price=market.current_price,

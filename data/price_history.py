@@ -792,12 +792,15 @@ def build_entry_market_data(
     EMPTY-history snapshot, which evaluate_entry rejects as insufficient (SKIP)
     rather than guessing.
 
-    Liquidity is not part of OHLCV: ``current_liquidity`` is the live snapshot
-    and ``pre_dip_liquidity`` defaults to it (neutral drain check) unless the
-    caller supplies a pre-dip figure.
+    Liquidity is not part of OHLCV: ``current_liquidity`` is the live snapshot.
+    ``pre_dip_liquidity`` defaults to ``0.0`` when unknown, which DISABLES the
+    entry's drain check (see :func:`strategies.entry.evaluate_entry` step 5) —
+    an honest "no signal" rather than defaulting to the current value, which
+    would make the drain check silently pass and read as false comfort. There is
+    no historical-liquidity source wired yet; supply a real figure to arm it.
     """
     now = time.time() if now is None else now
-    pre_dip = current_liquidity if pre_dip_liquidity is None else pre_dip_liquidity
+    pre_dip = 0.0 if pre_dip_liquidity is None else pre_dip_liquidity
 
     if history is not None and len(history) >= 2:
         ath_price, ath_timestamp = history.ath()

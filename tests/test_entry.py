@@ -157,3 +157,85 @@ def test_invalid_price_skips() -> None:
 
     assert decision.action is EntryAction.SKIP
     assert decision.position is None
+
+
+# --- Fix #1: volume-freshness gate (consistency with the exit) --------------
+
+# A declining price into a flat ~0.60 consolidation, long enough (20 x 1m) that
+# the 15m freshness window is fully populated.
+_DIP_PRICES = [
+    1.00, 0.97, 0.94, 0.90, 0.86, 0.82, 0.78, 0.74, 0.70, 0.68,
+    0.66, 0.64, 0.63, 0.62, 0.61, 0.60, 0.60, 0.60, 0.60, 0.60,
+]
+
+
+def test_volume_faded_skips() -> None:
+    """Proven runner whose volume has DIED (recent << peak) -> SKIP, not BUY.
+
+    This is the churn root cause: peak-based proven-runner passes, but current
+    volume is deep in the exit's dump zone, so the trade would volume_collapse
+    out immediately. The freshness gate must catch it at entry.
+    """
+    vols = [50.0] * 20
+    vols[3] = 5000.0  # a big early spike, then dead ever since
+    faded = make_market(
+        price_history=_DIP_PRICES, volume_history=vols, sample_interval_minutes=1.0,
+    )
+    decision = run(evaluate_entry(MINT, faded))
+
+    assert decision.action is EntryAction.SKIP
+    assert "volume faded" in decision.reason
+    assert decision.proven_runner is True          # it DID pass the runner gate
+    assert decision.volume_freshness < 0.40        # ...but volume is dead now
+
+
+def test_fresh_volume_reaches_buy() -> None:
+    """A proven runner whose volume is STILL alive clears the freshness gate."""
+    # Early spike for the runner gate, plus sustained recent volume (accumulation)
+    # so trailing 15m stays a healthy fraction of the peak window.
+    vols = [100.0, 100.0, 3000.0] + [100.0] * 7 + [400.0] * 10
+    fresh = make_market(
+        price_history=_DIP_PRICES, volume_history=vols, sample_interval_minutes=1.0,
+    )
+    decision = run(evaluate_entry(MINT, fresh))
+
+    assert decision.action is EntryAction.BUY
+    assert decision.volume_freshness >= 0.40
+
+
+# --- Fix #2: consolidation must be volume-backed ----------------------------
+
+def test_price_flat_but_volume_dead_waits() -> None:
+    """A tight price band with no recent trading is a flatline, not a dip -> WAIT.
+
+    Volume is alive enough 5-15m ago to clear the freshness gate, but the last
+    few minutes are dead — the price is only 'stable' because nobody is trading.
+    """
+    vols = [100.0, 100.0, 3000.0, 100.0, 100.0] + [400.0] * 10 + [10.0] * 5
+    dead = make_market(
+        price_history=_DIP_PRICES, volume_history=vols, sample_interval_minutes=1.0,
+    )
+    decision = run(evaluate_entry(MINT, dead))
+
+    assert decision.action is EntryAction.WAIT
+    assert "volume dead" in decision.reason
+    assert decision.consolidated is True           # price WAS tight...
+    assert decision.volume_freshness >= 0.40       # ...and it passed freshness
+
+
+# --- Fix #3: drain check honestly disabled without pre-dip liquidity ---------
+
+def test_drain_check_disabled_when_pre_dip_unknown() -> None:
+    """With no pre-dip liquidity (0.0), the drain check must NOT fire.
+
+    The same market with a real pre-dip figure would SKIP as drained; with the
+    figure unknown the check is disabled (honest 'no signal'), so a stabilised
+    dip above the liquidity floor still BUYs.
+    """
+    would_look_drained = make_market(current_liquidity=20_000.0, pre_dip_liquidity=0.0)
+    decision = run(evaluate_entry(MINT, would_look_drained))
+    assert decision.action is EntryAction.BUY      # drain check inert at pre_dip=0
+
+    # Sanity: a REAL pre-dip figure re-arms it and this pool reads as drained.
+    drained = make_market(current_liquidity=20_000.0, pre_dip_liquidity=60_000.0)
+    assert run(evaluate_entry(MINT, drained)).action is EntryAction.SKIP
